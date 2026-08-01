@@ -1,0 +1,40 @@
+name: Job Search Agent
+
+on:
+  schedule:
+    # 8:00 AM IST and 6:00 PM IST = 2:30 AM and 12:30 PM UTC (IST is UTC+5:30)
+    - cron: "30 2 * * *"
+    - cron: "30 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run job agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: python job_agent.py
+
+      - name: Commit updated log
+        run: |
+          git config user.name "job-agent-bot"
+          git config user.email "actions@github.com"
+          git add jobs_log.csv
+          git diff --staged --quiet || git commit -m "Update jobs_log.csv [skip ci]"
+          git push
