@@ -3,7 +3,7 @@
 Automated job search agent.
 
 Searches RemoteOK for jobs matching Yamin's skill set, filters to postings
-from the last 24 hours, scores each one with Claude, and — for anything
+from the last 24 hours, scores each one with Gemini, and — for anything
 scoring 7+ — emails a ready-to-send outreach draft via Resend.
 
 RemoteOK listings don't expose a hiring-manager email address (they link to
@@ -13,7 +13,7 @@ and paste it into the actual application form/portal within minutes of the
 posting going live.
 
 Required environment variables:
-    ANTHROPIC_API_KEY   Claude API key
+    GEMINI_API_KEY      Google Gemini API key
     RESEND_API_KEY      Resend API key
 
 Optional environment variables:
@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from anthropic import Anthropic
+import google.generativeai as genai
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,7 +41,7 @@ REMOTEOK_API_URL = "https://remoteok.com/api"
 KEYWORDS = ["ai agent", "fastapi", "whatsapp", "voice agent", "llm", "python"]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 24
-CLAUDE_MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-1.5-flash"
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
 LOG_FIELDS = [
@@ -143,10 +143,10 @@ def filter_recent_matching_jobs(jobs: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Claude scoring + outreach drafting
+# Gemini scoring + outreach drafting
 # ---------------------------------------------------------------------------
 
-def score_and_draft(client: Anthropic, job: dict) -> dict:
+def score_and_draft(model: genai.GenerativeModel, job: dict) -> dict:
     title = job.get("position", "Unknown role")
     company = job.get("company", "Unknown company")
     description = (job.get("description") or "")[:4000]
@@ -175,13 +175,8 @@ this job actually needs. Keep the email under 150 words.
 Respond with ONLY a JSON object, no other text, in exactly this shape:
 {{"score": <integer 1-10>, "reason": "<one sentence>", "email_subject": "<subject line>", "email_body": "<email text>"}}"""
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_block = next(b for b in response.content if b.type == "text")
-    raw = text_block.text.strip()
+    response = model.generate_content(prompt)
+    raw = response.text.strip()
     # Model sometimes wraps JSON in a ```json fence despite instructions — strip it.
     if raw.startswith("```"):
         raw = raw.strip("`")
@@ -241,14 +236,15 @@ def append_log(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
     resend_key = os.environ.get("RESEND_API_KEY")
-    if not anthropic_key:
-        sys.exit("ANTHROPIC_API_KEY is not set")
+    if not gemini_key:
+        sys.exit("GEMINI_API_KEY is not set")
     if not resend_key:
         sys.exit("RESEND_API_KEY is not set")
 
-    client = Anthropic(api_key=anthropic_key)
+    genai.configure(api_key=gemini_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
 
     print("Fetching RemoteOK listings...")
     all_jobs = fetch_remoteok_jobs()
@@ -271,7 +267,7 @@ def main() -> None:
         url = job.get("url") or f"https://remoteok.com/remote-jobs/{job_id}"
 
         try:
-            result = score_and_draft(client, job)
+            result = score_and_draft(model, job)
         except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
             print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
             log_rows.append({
@@ -310,7 +306,7 @@ def main() -> None:
             "reason": reason,
         })
 
-        time.sleep(1)  # be polite to the Claude API
+        time.sleep(1)  # be polite to the Gemini API
 
     append_log(log_rows)
     print(f"Done. {emailed_count} outreach draft(s) emailed to {NOTIFY_EMAIL}.")

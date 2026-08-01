@@ -5,7 +5,7 @@ Automated job hunter for Yamin. Twice a day it:
 1. Pulls the live [RemoteOK](https://remoteok.com/api) feed (free, no key needed).
 2. Filters to postings from the last 24 hours matching: `AI agent`, `FastAPI`,
    `WhatsApp`, `voice agent`, `LLM`, `Python`.
-3. Sends each match to Claude (`claude-sonnet-4-6`) to score fit 1-10 and draft
+3. Sends each match to Gemini (`gemini-1.5-flash`) to score fit 1-10 and draft
    a personalized outreach email based on the profile/template baked into
    `job_agent.py`.
 4. For anything scoring 7+, emails the draft + job link via
@@ -24,9 +24,9 @@ through the actual application channel.
 
 - **RemoteOK**: free, unauthenticated, no rate-limit key needed. It does
   block requests with no `User-Agent` header — already handled in the script.
-- **Claude API**: not literally free, but usage here is tiny (a handful of
-  short scoring calls per run, twice a day) and should stay in the cents/month
-  range on a pay-as-you-go key.
+- **Gemini API**: `gemini-1.5-flash` has a genuinely free tier (generous daily
+  request quota at the time of writing) — this script's usage (a handful of
+  short scoring calls per run, twice a day) should comfortably stay within it.
 - **Resend free tier**: 100 emails/day, 3,000/month, no credit card. The
   catch: until you verify a domain you own in Resend, you can only send
   **from** `onboarding@resend.dev` and only **to the email address on your
@@ -39,7 +39,7 @@ through the actual application channel.
 
 ### 1. Get your API keys
 
-- **Anthropic API key**: [console.anthropic.com](https://console.anthropic.com) → API Keys.
+- **Gemini API key**: [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → Create API key (free).
 - **Resend API key**: [resend.com](https://resend.com) → sign up (free) → API Keys.
   Use the key tied to the account whose inbox you want drafts sent to.
 
@@ -61,7 +61,7 @@ GitHub repo → **Settings → Secrets and variables → Actions → New reposit
 
 | Secret name         | Required | Value |
 |----------------------|----------|-------|
-| `ANTHROPIC_API_KEY`  | Yes | Your Anthropic key |
+| `GEMINI_API_KEY`     | Yes | Your Gemini key |
 | `RESEND_API_KEY`     | Yes | Your Resend key |
 | `RESEND_FROM`        | No  | Defaults to `onboarding@resend.dev`. Only set this once you've verified your own domain in Resend. |
 | `NOTIFY_EMAIL`       | No  | Defaults to `yaminbinyoosuf@gmail.com`. Must match the email on your Resend account until you verify a domain. |
@@ -85,7 +85,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=AIza...
 export RESEND_API_KEY=re_...
 # optional:
 # export RESEND_FROM=you@yourdomain.com
@@ -107,9 +107,10 @@ python job_agent.py
 - **Keywords / score threshold / lookback window**: edit the constants at the
   top of `job_agent.py` (`KEYWORDS`, `SCORE_THRESHOLD`, `LOOKBACK_HOURS`).
 - **Profile / email template**: edit `PROFILE` and `EMAIL_TEMPLATE` in
-  `job_agent.py` — Claude uses these directly to draft outreach.
-- **Model**: `CLAUDE_MODEL` is set to `claude-sonnet-4-6`. Swap it for a newer
-  Claude model if you want stronger scoring at higher per-call cost.
+  `job_agent.py` — Gemini uses these directly to draft outreach.
+- **Model**: `GEMINI_MODEL` is set to `gemini-1.5-flash`. Swap it for
+  `gemini-1.5-pro` (or a newer Gemini model) if you want stronger scoring at
+  higher per-call cost/lower free-tier quota.
 - **Other job boards**: RemoteOK is the only source for now, per the "start
   simple, free tools only" brief. Adding a second free source (e.g. a
   We Work Remotely RSS feed) is a matter of writing another `fetch_*` function

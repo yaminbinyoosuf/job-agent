@@ -25,7 +25,7 @@ jobs:
 
       - name: Run job agent
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
