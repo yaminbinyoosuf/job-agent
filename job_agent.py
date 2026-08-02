@@ -55,7 +55,8 @@ KEYWORDS = [
 ]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 72
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MIN_INTERVAL_S = 13  # Free tier: 5 req/min. 60 / 5 = 12s; add margin.
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
 LOG_FIELDS = [
@@ -336,12 +337,19 @@ def main() -> None:
 
     log_rows = []
     emailed_count = 0
+    last_gemini_call = 0.0
 
     for job in new_candidates:
         job_id = str(job["id"])
         title = job.get("position", "Unknown role")
         company = job.get("company", "Unknown company")
         url = job.get("url") or ""
+
+        # Pace Gemini requests to stay under the free-tier 5 req/min limit.
+        wait = GEMINI_MIN_INTERVAL_S - (time.monotonic() - last_gemini_call)
+        if wait > 0:
+            time.sleep(wait)
+        last_gemini_call = time.monotonic()
 
         try:
             result = score_and_draft(client, job)
@@ -370,7 +378,6 @@ def main() -> None:
             emailed = send_email_via_resend(resend_key, subject, body)
             if emailed:
                 emailed_count += 1
-            time.sleep(1)  # be polite to the Resend API
 
         log_rows.append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -382,8 +389,6 @@ def main() -> None:
             "emailed": emailed,
             "reason": reason,
         })
-
-        time.sleep(1)  # be polite to the Gemini API
 
     append_log(log_rows)
     print(f"Done. {emailed_count} outreach draft(s) emailed to {NOTIFY_EMAIL}.")
