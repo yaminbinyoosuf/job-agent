@@ -55,7 +55,7 @@ KEYWORDS = [
 ]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 72
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-1.5-flash"
 GEMINI_MIN_INTERVAL_S = 13  # Free tier: 5 req/min. 60 / 5 = 12s; add margin.
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
