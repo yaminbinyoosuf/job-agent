@@ -2,13 +2,12 @@ name: Job Search Agent
 
 on:
   schedule:
-    - cron: "30 2 * * *"   # 08:00 IST
-    - cron: "30 12 * * *"  # 18:00 IST
+    - cron: "30 2 * * *"
+    - cron: "30 12 * * *"
   workflow_dispatch: {}
 
-# Need write so the job can push the updated jobs_log.csv
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-agent:
@@ -17,11 +16,6 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-        with:
-          # Full history so rebase has the real tip of main/master
-          fetch-depth: 0
-          # Use the default token (has write because of permissions above)
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,50 +29,4 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          # Optional overrides if you set them as secrets
-          RESEND_FROM: ${{ secrets.RESEND_FROM }}
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
         run: python job_agent.py
-
-      - name: Commit and push jobs_log.csv
-        run: |
-          set -euo pipefail
-
-          git config user.name  "job-agent-bot"
-          git config user.email "job-agent-bot@users.noreply.github.com"
-
-          # Only continue if the log actually changed
-          if git diff --quiet -- jobs_log.csv 2>/dev/null && \
-             git diff --cached --quiet -- jobs_log.csv 2>/dev/null && \
-             [ -z "$(git ls-files --others --exclude-standard -- jobs_log.csv)" ]; then
-            echo "jobs_log.csv unchanged — nothing to commit"
-            exit 0
-          fi
-
-          git add jobs_log.csv
-          git commit -m "Update jobs_log.csv [skip ci]" || {
-            echo "Nothing to commit"
-            exit 0
-          }
-
-          # Detect default branch (main or master)
-          BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "Pushing to branch: $BRANCH"
-
-          # Pull with rebase so we don't overwrite concurrent updates,
-          # then push. Retry a couple of times in case of a race.
-          for i in 1 2 3; do
-            echo "Attempt $i: git pull --rebase origin $BRANCH"
-            if git pull --rebase origin "$BRANCH"; then
-              if git push origin "$BRANCH"; then
-                echo "Push succeeded"
-                exit 0
-              fi
-            fi
-            echo "Pull/push failed (race?). Waiting and retrying..."
-            sleep $((i * 5))
-            git fetch origin
-          done
-
-          echo "Failed to push after retries"
-          exit 1
