@@ -55,7 +55,15 @@ KEYWORDS = [
 ]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 72
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-1.5-flash"
+GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL") or ""
+# Preference order — first available on the account wins.
+GEMINI_MODEL_PREFERENCES = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
 GEMINI_MIN_INTERVAL_S = 13  # Free tier: 5 req/min. 60 / 5 = 12s; add margin.
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
@@ -205,7 +213,36 @@ def filter_recent_matching_jobs(jobs: list[dict]) -> list[dict]:
 # Gemini scoring + outreach drafting
 # ---------------------------------------------------------------------------
 
-def score_and_draft(client: genai.Client, job: dict) -> dict:
+def pick_gemini_model(client: genai.Client) -> str:
+    """Pick a Gemini model this API key can actually call. Prefer the
+    explicit GEMINI_MODEL env var, otherwise the first entry in
+    GEMINI_MODEL_PREFERENCES that ListModels returns as available for
+    generateContent. Falls back to the first preference and lets the
+    request itself fail loudly."""
+    available: set[str] = set()
+    try:
+        for m in client.models.list():
+            name = (m.name or "").removeprefix("models/")
+            methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if "generateContent" in methods or not methods:
+                available.add(name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Model listing failed ({exc}); trying preferred model as-is.", file=sys.stderr)
+
+    if GEMINI_MODEL_ENV:
+        if not available or GEMINI_MODEL_ENV in available:
+            return GEMINI_MODEL_ENV
+        print(f"  GEMINI_MODEL='{GEMINI_MODEL_ENV}' not in ListModels; using it anyway.", file=sys.stderr)
+        return GEMINI_MODEL_ENV
+
+    for candidate in GEMINI_MODEL_PREFERENCES:
+        if candidate in available:
+            return candidate
+
+    return GEMINI_MODEL_PREFERENCES[0]
+
+
+def score_and_draft(client: genai.Client, model: str, job: dict) -> dict:
     title = job.get("position", "Unknown role")
     company = job.get("company", "Unknown company")
     description = (job.get("description") or "")[:4000]
@@ -234,7 +271,7 @@ this job actually needs. Keep the email under 150 words.
 Respond with ONLY a JSON object, no other text, in exactly this shape:
 {{"score": <integer 1-10>, "reason": "<one sentence>", "email_subject": "<subject line>", "email_body": "<email text>"}}"""
 
-    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
     raw = (response.text or "").strip()
     # Model may wrap JSON in a ```json fence or prepend prose — extract the first {...} block.
     match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -316,6 +353,8 @@ def main() -> None:
         sys.exit("RESEND_API_KEY is not set")
 
     client = genai.Client(api_key=gemini_key)
+    gemini_model = pick_gemini_model(client)
+    print(f"Using Gemini model: {gemini_model}")
 
     print("Fetching listings...")
     all_jobs: list[dict] = []
@@ -352,7 +391,7 @@ def main() -> None:
         last_gemini_call = time.monotonic()
 
         try:
-            result = score_and_draft(client, job)
+            result = score_and_draft(client, gemini_model, job)
         except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
             print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
             log_rows.append({
