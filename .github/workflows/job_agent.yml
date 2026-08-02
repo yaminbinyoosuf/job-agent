@@ -42,4 +42,4 @@ jobs:
           git reset --hard origin/master
           git add jobs_log.csv
           git diff --staged --quiet || git commit -m "Update jobs_log.csv [skip ci]"
-          git push
+          git push --force
