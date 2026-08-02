@@ -28,7 +28,9 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -39,9 +41,20 @@ from google import genai
 # ---------------------------------------------------------------------------
 
 REMOTEOK_API_URL = "https://remoteok.com/api"
-KEYWORDS = ["ai agent", "fastapi", "whatsapp", "voice agent", "llm", "python"]
+WWR_RSS_URL = "https://weworkremotely.com/categories/remote-programming-jobs.rss"
+KEYWORDS = [
+    "ai agent",
+    "agentic",
+    "fastapi",
+    "whatsapp",
+    "voice agent",
+    "llm",
+    "python",
+    "backend",
+    "automation",
+]
 SCORE_THRESHOLD = 7
-LOOKBACK_HOURS = 24
+LOOKBACK_HOURS = 72
 GEMINI_MODEL = "gemini-2.5-flash"
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
@@ -96,15 +109,59 @@ Yamin
 # RemoteOK
 # ---------------------------------------------------------------------------
 
+USER_AGENT = "Mozilla/5.0 (compatible; job-agent/1.0)"
+
+
 def fetch_remoteok_jobs() -> list[dict]:
     """Fetch the current RemoteOK listing feed. RemoteOK blocks requests
     without a browser-like User-Agent, and the first array element is a
     legal notice, not a job."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; job-agent/1.0)"}
-    resp = requests.get(REMOTEOK_API_URL, headers=headers, timeout=30)
+    resp = requests.get(REMOTEOK_API_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    return [job for job in data if isinstance(job, dict) and job.get("id")]
+    return [
+        {**job, "id": f"remoteok:{job['id']}", "source": "RemoteOK"}
+        for job in data
+        if isinstance(job, dict) and job.get("id")
+    ]
+
+
+def fetch_wwr_jobs() -> list[dict]:
+    """Fetch WeWorkRemotely's programming feed and normalize to the same
+    shape as RemoteOK: id, position, company, description, tags, url, epoch.
+    RSS titles are 'Company Name: Role Title'."""
+    resp = requests.get(WWR_RSS_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    jobs = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc_html = (item.findtext("description") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        guid = (item.findtext("guid") or link).strip()
+        if not guid:
+            continue
+        company, sep, position = title.partition(": ")
+        if not sep:
+            company, position = "", company
+        epoch = None
+        if pub:
+            try:
+                epoch = parsedate_to_datetime(pub).timestamp()
+            except (TypeError, ValueError):
+                pass
+        jobs.append({
+            "id": f"wwr:{guid}",
+            "position": position.strip(),
+            "company": company.strip(),
+            "description": re.sub(r"<[^>]+>", " ", desc_html),
+            "tags": [],
+            "url": link,
+            "epoch": epoch,
+            "source": "WeWorkRemotely",
+        })
+    return jobs
 
 
 def job_posted_at(job: dict) -> datetime | None:
@@ -259,8 +316,15 @@ def main() -> None:
 
     client = genai.Client(api_key=gemini_key)
 
-    print("Fetching RemoteOK listings...")
-    all_jobs = fetch_remoteok_jobs()
+    print("Fetching listings...")
+    all_jobs: list[dict] = []
+    for name, fetcher in (("RemoteOK", fetch_remoteok_jobs), ("WeWorkRemotely", fetch_wwr_jobs)):
+        try:
+            jobs = fetcher()
+            print(f"  {name}: {len(jobs)} listings")
+            all_jobs.extend(jobs)
+        except Exception as exc:  # noqa: BLE001 - one source down shouldn't kill the run
+            print(f"  {name}: fetch failed: {exc}", file=sys.stderr)
     print(f"  {len(all_jobs)} total listings")
 
     candidates = filter_recent_matching_jobs(all_jobs)
@@ -277,7 +341,7 @@ def main() -> None:
         job_id = str(job["id"])
         title = job.get("position", "Unknown role")
         company = job.get("company", "Unknown company")
-        url = job.get("url") or f"https://remoteok.com/remote-jobs/{job_id}"
+        url = job.get("url") or ""
 
         try:
             result = score_and_draft(client, job)
