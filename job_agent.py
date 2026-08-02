@@ -25,13 +25,14 @@ Optional environment variables:
 import csv
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-import google.generativeai as genai
+from google import genai
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,7 +42,7 @@ REMOTEOK_API_URL = "https://remoteok.com/api"
 KEYWORDS = ["ai agent", "fastapi", "whatsapp", "voice agent", "llm", "python"]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 24
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 LOG_PATH = Path(__file__).parent / "jobs_log.csv"
 LOG_FIELDS = [
@@ -146,7 +147,7 @@ def filter_recent_matching_jobs(jobs: list[dict]) -> list[dict]:
 # Gemini scoring + outreach drafting
 # ---------------------------------------------------------------------------
 
-def score_and_draft(model: genai.GenerativeModel, job: dict) -> dict:
+def score_and_draft(client: genai.Client, job: dict) -> dict:
     title = job.get("position", "Unknown role")
     company = job.get("company", "Unknown company")
     description = (job.get("description") or "")[:4000]
@@ -175,15 +176,13 @@ this job actually needs. Keep the email under 150 words.
 Respond with ONLY a JSON object, no other text, in exactly this shape:
 {{"score": <integer 1-10>, "reason": "<one sentence>", "email_subject": "<subject line>", "email_body": "<email text>"}}"""
 
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
-    # Model sometimes wraps JSON in a ```json fence despite instructions — strip it.
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    return json.loads(raw)
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    raw = (response.text or "").strip()
+    # Model may wrap JSON in a ```json fence or prepend prose — extract the first {...} block.
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object in model output: {raw[:200]}")
+    return json.loads(match.group(0))
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +215,25 @@ def send_email_via_resend(api_key: str, subject: str, body: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def load_seen_job_ids() -> set[str]:
+    """Return job_ids we've already finished with. A row is 'done' only if
+    we made a final decision on it — a scoring error or a strong match whose
+    email failed to send should be retried next run, not silently skipped."""
     if not LOG_PATH.exists():
         return set()
+    seen: set[str] = set()
     with LOG_PATH.open(newline="", encoding="utf-8") as f:
-        return {row["job_id"] for row in csv.DictReader(f)}
+        for row in csv.DictReader(f):
+            if row.get("reason", "").startswith("error:"):
+                continue
+            try:
+                score = int(row.get("score") or 0)
+            except ValueError:
+                score = 0
+            emailed = row.get("emailed", "").lower() == "true"
+            if score >= SCORE_THRESHOLD and not emailed:
+                continue
+            seen.add(row["job_id"])
+    return seen
 
 
 def append_log(rows: list[dict]) -> None:
@@ -243,8 +257,7 @@ def main() -> None:
     if not resend_key:
         sys.exit("RESEND_API_KEY is not set")
 
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=gemini_key)
 
     print("Fetching RemoteOK listings...")
     all_jobs = fetch_remoteok_jobs()
@@ -267,7 +280,7 @@ def main() -> None:
         url = job.get("url") or f"https://remoteok.com/remote-jobs/{job_id}"
 
         try:
-            result = score_and_draft(model, job)
+            result = score_and_draft(client, job)
         except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
             print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
             log_rows.append({
