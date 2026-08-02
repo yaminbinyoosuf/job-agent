@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   run-agent:
@@ -16,6 +16,9 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,4 +32,45 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
         run: python job_agent.py
+
+      - name: Commit and push jobs_log.csv
+        run: |
+          set -euo pipefail
+
+          git config user.name  "job-agent-bot"
+          git config user.email "job-agent-bot@users.noreply.github.com"
+
+          if git diff --quiet -- jobs_log.csv 2>/dev/null && \
+             git diff --cached --quiet -- jobs_log.csv 2>/dev/null && \
+             [ -z "$(git ls-files --others --exclude-standard -- jobs_log.csv)" ]; then
+            echo "jobs_log.csv unchanged - nothing to commit"
+            exit 0
+          fi
+
+          git add jobs_log.csv
+          git commit -m "Update jobs_log.csv [skip ci]" || {
+            echo "Nothing to commit"
+            exit 0
+          }
+
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Pushing to branch: $BRANCH"
+
+          for i in 1 2 3; do
+            echo "Attempt $i: git pull --rebase origin $BRANCH"
+            git fetch origin "$BRANCH"
+            if git pull --rebase origin "$BRANCH"; then
+              if git push origin "$BRANCH"; then
+                echo "Push succeeded"
+                exit 0
+              fi
+            fi
+            echo "Pull/push failed (race?). Waiting and retrying..."
+            sleep $((i * 5))
+          done
+
+          echo "Failed to push after retries"
+          exit 1
