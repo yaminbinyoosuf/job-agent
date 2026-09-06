@@ -20,9 +20,13 @@ Optional environment variables:
     RESEND_FROM         Verified sender address (default: onboarding@resend.dev,
                          Resend's shared test sender — see README)
     NOTIFY_EMAIL        Where match digests are sent (default: yaminbinyoosuf@gmail.com)
+
+Optional:
+    COGEXT_API_KEY      COGEXT API key for commitment tracking (cogextai.com)
 """
 
 import csv
+import uuid
 import json
 import os
 import re
@@ -80,6 +84,12 @@ LOG_FIELDS = [
 
 RESEND_FROM = os.environ.get("RESEND_FROM") or "onboarding@resend.dev"
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or "yaminbinyoosuf@gmail.com"
+
+
+COGEXT_API_KEY = os.environ.get("COGEXT_API_KEY") or ""
+COGEXT_API_URL = "https://api.cogextai.com/api/v1"
+# Fixed agent UUID for this job-agent process
+COGEXT_AGENT_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
 PROFILE = """\
 Name: Yamin Binyoosuf
@@ -340,6 +350,37 @@ def append_log(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+
+# ---------------------------------------------------------------------------
+# COGEXT commitment tracking
+# ---------------------------------------------------------------------------
+
+def track_commitment(job_id: str, title: str, company: str, url: str, score: int) -> None:
+    """Report a job application commitment to COGEXT."""
+    if not COGEXT_API_KEY:
+        return
+    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, job_id))
+    message = (
+        f"I will apply to the {title} role at {company} (score {score}/10). "
+        f"I will send the outreach email and follow up within 48 hours. Apply URL: {url}"
+    )
+    try:
+        resp = requests.post(
+            f"{COGEXT_API_URL}/ingest",
+            headers={"Authorization": f"Bearer {COGEXT_API_KEY}", "Content-Type": "application/json"},
+            json={"source_agent_id": COGEXT_AGENT_ID, "session_id": session_id, "message": message},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            count = len(data) if isinstance(data, list) else data.get("count", "?")
+            print(f"    COGEXT: {count} commitment(s) tracked")
+        else:
+            print(f"    COGEXT: ingest returned {resp.status_code}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    COGEXT: tracking failed ({exc})", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -412,6 +453,7 @@ def main() -> None:
 
         emailed = False
         if score >= SCORE_THRESHOLD:
+            track_commitment(job_id, title, company, url, score)
             subject = result.get("email_subject") or f"AI Agent + FastAPI Developer — Available for {title}"
             body = f"{result.get('email_body', '')}\n\n---\nJob: {title} @ {company}\nApply: {url}\nMatch score: {score}/10\n"
             emailed = send_email_via_resend(resend_key, subject, body)
