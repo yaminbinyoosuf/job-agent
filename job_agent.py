@@ -38,7 +38,12 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
-from google import genai
+
+# google-genai is only imported when GEMINI_API_KEY is used (not DeepSeek).
+try:
+    from google import genai as _genai  # type: ignore
+except ImportError:  # pragma: no cover
+    _genai = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,8 +64,14 @@ KEYWORDS = [
 ]
 SCORE_THRESHOLD = 7
 LOOKBACK_HOURS = 72
+
+# DeepSeek (preferred when DEEPSEEK_API_KEY is set — no extra package, uses requests).
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") or ""
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
+
+# Gemini fallback.
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL") or ""
-# Preference order — first available on the account wins.
 GEMINI_MODEL_PREFERENCES = [
     "gemini-flash-latest",
     "gemini-2.5-flash",
@@ -252,13 +263,12 @@ def pick_gemini_model(client: genai.Client) -> str:
     return GEMINI_MODEL_PREFERENCES[0]
 
 
-def score_and_draft(client: genai.Client, model: str, job: dict) -> dict:
+def _build_score_prompt(job: dict) -> str:
     title = job.get("position", "Unknown role")
     company = job.get("company", "Unknown company")
     description = (job.get("description") or "")[:4000]
     tags = ", ".join(job.get("tags", []) or [])
-
-    prompt = f"""You are helping Yamin evaluate a remote job posting and draft outreach.
+    return f"""You are helping Yamin evaluate a remote job posting and draft outreach.
 
 CANDIDATE PROFILE:
 {PROFILE}
@@ -281,13 +291,40 @@ this job actually needs. Keep the email under 150 words.
 Respond with ONLY a JSON object, no other text, in exactly this shape:
 {{"score": <integer 1-10>, "reason": "<one sentence>", "email_subject": "<subject line>", "email_body": "<email text>"}}"""
 
-    response = client.models.generate_content(model=model, contents=prompt)
-    raw = (response.text or "").strip()
-    # Model may wrap JSON in a ```json fence or prepend prose — extract the first {...} block.
+
+def _parse_json_response(raw: str) -> dict:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON object in model output: {raw[:200]}")
     return json.loads(match.group(0))
+
+
+def score_and_draft_deepseek(job: dict) -> dict:
+    """Score a job and draft outreach using the DeepSeek API."""
+    prompt = _build_score_prompt(job)
+    resp = requests.post(
+        DEEPSEEK_BASE_URL,
+        headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    return _parse_json_response(raw)
+
+
+def score_and_draft(client, model: str, job: dict) -> dict:
+    prompt = _build_score_prompt(job)
+    response = client.models.generate_content(model=model, contents=prompt)
+    raw = (response.text or "").strip()
+    return _parse_json_response(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -386,16 +423,25 @@ def track_commitment(job_id: str, title: str, company: str, url: str, score: int
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    gemini_key = os.environ.get("GEMINI_API_KEY")
     resend_key = os.environ.get("RESEND_API_KEY")
-    if not gemini_key:
-        sys.exit("GEMINI_API_KEY is not set")
     if not resend_key:
         sys.exit("RESEND_API_KEY is not set")
 
-    client = genai.Client(api_key=gemini_key)
-    gemini_model = pick_gemini_model(client)
-    print(f"Using Gemini model: {gemini_model}")
+    # Pick AI backend: DeepSeek (preferred) or Gemini fallback.
+    use_deepseek = bool(DEEPSEEK_API_KEY)
+    client = None
+    gemini_model = None
+    if use_deepseek:
+        print(f"Using DeepSeek model: {DEEPSEEK_MODEL}")
+    else:
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        if not gemini_key:
+            sys.exit("Set DEEPSEEK_API_KEY or GEMINI_API_KEY")
+        if _genai is None:
+            sys.exit("google-genai package not installed; run: pip install google-genai")
+        client = _genai.Client(api_key=gemini_key)
+        gemini_model = pick_gemini_model(client)
+        print(f"Using Gemini model: {gemini_model}")
 
     print("Fetching listings...")
     all_jobs: list[dict] = []
@@ -425,14 +471,19 @@ def main() -> None:
         company = job.get("company", "Unknown company")
         url = job.get("url") or ""
 
-        # Pace Gemini requests to stay under the free-tier 5 req/min limit.
-        wait = GEMINI_MIN_INTERVAL_S - (time.monotonic() - last_gemini_call)
-        if wait > 0:
-            time.sleep(wait)
-        last_gemini_call = time.monotonic()
+        if not use_deepseek:
+            # Pace Gemini requests — free tier: 5 req/min.
+            wait = GEMINI_MIN_INTERVAL_S - (time.monotonic() - last_gemini_call)
+            if wait > 0:
+                time.sleep(wait)
+            last_gemini_call = time.monotonic()
 
         try:
-            result = score_and_draft(client, gemini_model, job)
+            result = (
+                score_and_draft_deepseek(job)
+                if use_deepseek
+                else score_and_draft(client, gemini_model, job)
+            )
         except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
             print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
             log_rows.append({
