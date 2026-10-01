@@ -1,117 +1,141 @@
 # Job Search Agent
 
-Automated job hunter for Yamin. Twice a day it:
+An automated job hunter for Yamin Binyoosuf. Twice a day it:
 
-1. Pulls the live [RemoteOK](https://remoteok.com/api) feed (free, no key needed).
-2. Filters to postings from the last 24 hours matching: `AI agent`, `FastAPI`,
-   `WhatsApp`, `voice agent`, `LLM`, `Python`.
-3. Sends each match to Gemini (`gemini-1.5-flash`) to score fit 1-10 and draft
-   a personalized outreach email based on the profile/template baked into
-   `job_agent.py`.
-4. For anything scoring 7+, emails the draft + job link via
-   [Resend](https://resend.com) so it can be reviewed and pasted into the
-   real application form within minutes of the posting going live.
-5. Logs every job it looked at (matched or not, emailed or not) to
-   `jobs_log.csv`, and skips job IDs it's already logged on future runs.
+1. Pulls six free, key-less remote job feeds — **RemoteOK**, **WeWorkRemotely**
+   (programming + devops RSS), **Remotive**, **Arbeitnow**, **Jobicy**, and
+   **Hacker News "Who is hiring?"**.
+2. Normalizes and de-duplicates them, keeps postings inside the lookback
+   window, drops obviously non-engineering roles by title, then keeps postings
+   matching the keyword set.
+3. Scores each posting 1–10 with **DeepSeek** and drafts a personalized
+   outreach email grounded in Yamin's real resume.
+4. For anything scoring 7+, emails the score, the reasoning, the apply link,
+   any hiring contact published in the posting, and a ready-to-send outreach
+   draft to `NOTIFY_EMAIL`.
+5. Logs every posting it looked at to `jobs_log.csv`, and skips job IDs it has
+   already finished with on later runs.
 
-**Important — this does not cold-email companies directly.** RemoteOK listings
-link to an apply page, not a hiring manager's inbox, so there's no address to
-send to. The agent instead emails the drafted outreach *to you*
-(`NOTIFY_EMAIL`, default `yaminbinyoosuf@gmail.com`) so you can send it
-through the actual application channel.
-
-## Free-tier limits to know about
-
-- **RemoteOK**: free, unauthenticated, no rate-limit key needed. It does
-  block requests with no `User-Agent` header — already handled in the script.
-- **Gemini API**: `gemini-1.5-flash` has a genuinely free tier (generous daily
-  request quota at the time of writing) — this script's usage (a handful of
-  short scoring calls per run, twice a day) should comfortably stay within it.
-- **Resend free tier**: 100 emails/day, 3,000/month, no credit card. The
-  catch: until you verify a domain you own in Resend, you can only send
-  **from** `onboarding@resend.dev` and only **to the email address on your
-  Resend account**. That's exactly this script's default setup (draft goes to
-  your own inbox), so no domain verification is required to get started.
-- **GitHub Actions**: free for public repos; 2,000 min/month free on private
-  repos, which this workflow uses only a few minutes of per month.
+**This does not cold-email companies.** Listings link to an apply page, not a
+hiring manager's inbox. The agent emails the drafted outreach *to you* so you
+can send it through the real application channel within minutes of a posting
+going live. See `AUTO_APPLY` below for the one exception.
 
 ## Setup
 
-### 1. Get your API keys
+### 1. Repo secrets
 
-- **Gemini API key**: [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → Create API key (free).
-- **Resend API key**: [resend.com](https://resend.com) → sign up (free) → API Keys.
-  Use the key tied to the account whose inbox you want drafts sent to.
+GitHub repo → **Settings → Secrets and variables → Actions → Secrets**:
 
-### 2. Push this folder to a GitHub repo
+| Secret | Required | Notes |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | **Yes** | Primary engine. [platform.deepseek.com](https://platform.deepseek.com/api_keys) |
+| `RESEND_API_KEY` | **Yes** | Email delivery. [resend.com](https://resend.com) → API Keys |
+| `RESEND_FROM` | No | Defaults to `onboarding@resend.dev` |
+| `NOTIFY_EMAIL` | No | Defaults to `yaminbinyoosuf@gmail.com`. Must match your Resend account email until you verify a domain. |
+| `GEMINI_API_KEY` | No | Fallback engine, used only if `DEEPSEEK_API_KEY` is missing |
+| `COGEXT_API_KEY` | No | Commitment tracking |
 
-```bash
-cd job-agent
-git init
-git add .
-git commit -m "Add job search agent"
-git branch -M main
-git remote add origin https://github.com/<you>/job-agent.git
-git push -u origin main
-```
+### 2. Repo variables
 
-### 3. Add repo secrets
+GitHub repo → **Settings → Secrets and variables → Actions → Variables**
+(all optional):
 
-GitHub repo → **Settings → Secrets and variables → Actions → New repository secret**:
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Set to `deepseek-reasoner` for deeper scoring (slower, costlier) |
+| `AUTO_APPLY` | `false` | See below |
+| `MAX_JOBS_PER_RUN` | `40` | Caps API spend per run |
 
-| Secret name         | Required | Value |
-|----------------------|----------|-------|
-| `GEMINI_API_KEY`     | Yes | Your Gemini key |
-| `RESEND_API_KEY`     | Yes | Your Resend key |
-| `RESEND_FROM`        | No  | Defaults to `onboarding@resend.dev`. Only set this once you've verified your own domain in Resend. |
-| `NOTIFY_EMAIL`       | No  | Defaults to `yaminbinyoosuf@gmail.com`. Must match the email on your Resend account until you verify a domain. |
+### 3. Verify the wiring
 
-### 4. Enable the workflow
+GitHub repo → **Actions → Job Search Agent → Run workflow** → choose
+**`self-test`**. This makes one real DeepSeek call and sends one test email, and
+tells you exactly which piece is broken — no guessing.
 
-The workflow at `.github/workflows/job_agent.yml` runs automatically at
-8:00 AM and 6:00 PM IST (`30 2 * * *` and `30 12 * * *` UTC) once it's on
-`main`. It also needs **write access to push the updated `jobs_log.csv`** —
-GitHub Actions' default token has this by default for repos you own; if pushes
-fail, check Settings → Actions → General → Workflow permissions is set to
-"Read and write permissions".
+Then run **`dry-run`**: it exercises the whole pipeline, scores real postings,
+and writes the log, but sends no email.
 
-To test immediately instead of waiting for the schedule: GitHub repo →
-**Actions → Job Search Agent → Run workflow**.
+The scheduled runs (`08:00` and `18:00` IST) start automatically once the
+workflow is on `master`.
 
-### 5. Run it locally (optional, for testing)
+## Run locally
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-export GEMINI_API_KEY=AIza...
+export DEEPSEEK_API_KEY=sk-...
 export RESEND_API_KEY=re_...
-# optional:
-# export RESEND_FROM=you@yourdomain.com
-# export NOTIFY_EMAIL=you@example.com
 
-python job_agent.py
+python job_agent.py --self-test   # check the wiring
+python job_agent.py --dry-run     # full pipeline, no email sent
+python job_agent.py               # the real thing
 ```
+
+## Tuning
+
+All the knobs are near the top of `job_agent.py`:
+
+- `KEYWORDS` — positive match against title + description + tags.
+- `TITLE_BLOCKLIST` — roles dropped by title alone (sales, marketing,
+  accounting, recruiting, support, …). This saves DeepSeek calls on postings
+  that can never be a fit.
+- `SCORE_THRESHOLD` (7), `LOOKBACK_HOURS` (72), `MAX_JOBS_PER_RUN` (40) —
+  overridable by environment variable.
+- `PROFILE` — built from `Yamin_Bin_Yoosuf_Mercor_Final_Resume.docx`. **Update
+  this when the resume changes**; it drives both scoring and the drafted emails.
+- `EMAIL_TEMPLATE` — the tone/structure the drafts follow.
+
+## `AUTO_APPLY`
+
+Off by default, and deliberately so.
+
+When `AUTO_APPLY=true`, the agent *additionally* sends the drafted outreach
+directly to a contact address **that the posting itself published**. Postings
+with no published contact still just go to your inbox.
+
+This is the only path that emails a third party. Before turning it on, be aware
+that automated cold outreach can look like spam, can breach a job board's terms,
+and can burn a domain's sending reputation if it goes wrong. The agent only ever
+uses addresses the posting published for contact, and ignores
+`noreply@`/`privacy@`/`accessibility@`-style addresses.
+
+## Free-tier limits
+
+- **Job feeds**: all six are free and need no API key. RemoteOK requires a
+  browser-like `User-Agent` (handled).
+- **DeepSeek**: pay-as-you-go and cheap, but not free. `deepseek-chat` costs a
+  fraction of a cent per posting. A capped run of 40 postings is small change;
+  lower `MAX_JOBS_PER_RUN` if you want a hard ceiling.
+- **Resend**: 100 emails/day, 3,000/month free. Until you verify your own
+  domain you can only send **from** `onboarding@resend.dev` and only **to** the
+  address on your Resend account — which is exactly how this is configured.
+- **GitHub Actions**: a few minutes per month.
 
 ## Files
 
 - `job_agent.py` — the agent
 - `requirements.txt` — Python deps
-- `.github/workflows/job_agent.yml` — cron schedule
-- `jobs_log.csv` — created automatically on first run; tracks every job seen
-  so re-runs don't re-score or re-email the same posting
+- `.github/workflows/job_agent.yml` — schedule + manual dispatch
+- `jobs_log.csv` — every posting seen, so re-runs don't re-score or re-email
 
-## Tuning
+## Troubleshooting
 
-- **Keywords / score threshold / lookback window**: edit the constants at the
-  top of `job_agent.py` (`KEYWORDS`, `SCORE_THRESHOLD`, `LOOKBACK_HOURS`).
-- **Profile / email template**: edit `PROFILE` and `EMAIL_TEMPLATE` in
-  `job_agent.py` — Gemini uses these directly to draft outreach.
-- **Model**: `GEMINI_MODEL` is set to `gemini-1.5-flash`. Swap it for
-  `gemini-1.5-pro` (or a newer Gemini model) if you want stronger scoring at
-  higher per-call cost/lower free-tier quota.
-- **Other job boards**: RemoteOK is the only source for now, per the "start
-  simple, free tools only" brief. Adding a second free source (e.g. a
-  We Work Remotely RSS feed) is a matter of writing another `fetch_*` function
-  and merging its output into `filter_recent_matching_jobs`.
+Every scheduled run failed from 2026-09-06 to 2026-10-01. The causes, all fixed:
+
+1. **`NameError: name 'genai' is not defined`** — commit `a661b8e` renamed the
+   Gemini import to `_genai` but left the annotation `client: genai.Client`.
+   Python evaluates annotations at import time, so the script died before
+   `main()` ran. Fixed with `from __future__ import annotations`.
+2. **`DEEPSEEK_API_KEY` was never passed to the workflow**, so DeepSeek — the
+   documented default engine — was never used and the code fell through to a
+   Gemini path whose package wasn't installed.
+3. **Log schema drift** — `jobs_log.csv` used `source`/`notified` while the
+   code wrote `emailed`. `DictReader` returned no `emailed` value, so every
+   strong match looked un-emailed and was re-scored and re-emailed on every
+   run. `migrate_log_if_needed()` now repairs the header on startup (keeping a
+   `.bak`), and `requirements.txt` pins the fallback SDK.
+
+If a run fails, open the failed step's log — the agent prints the failing
+source, the HTTP status, and the model error rather than swallowing them.

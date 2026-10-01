@@ -1,1 +1,4 @@
 requests>=2.31.0
+# Optional: only needed for the Gemini fallback path used when
+# DEEPSEEK_API_KEY is not configured.
+google-genai>=1.0.0,<3.0.0

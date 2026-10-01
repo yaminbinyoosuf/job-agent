@@ -4,15 +4,29 @@ on:
   schedule:
     - cron: "30 2 * * *"
     - cron: "30 12 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        options:
+          - run
+          - self-test
+          - dry-run
+        default: run
 
 permissions:
   contents: write
 
+# Never let the two daily runs overlap and race on jobs_log.csv.
+concurrency:
+  group: job-agent
+  cancel-in-progress: false
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -30,13 +44,30 @@ jobs:
 
       - name: Run job agent
         env:
+          # Primary engine. This was missing from the workflow, so DeepSeek
+          # was never actually used despite being the documented default.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
+          # Fallback engine, only used when DEEPSEEK_API_KEY is absent.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Delivery.
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-        run: python job_agent.py
+          # Optional.
+          COGEXT_API_KEY: ${{ secrets.COGEXT_API_KEY }}
+          AUTO_APPLY: ${{ vars.AUTO_APPLY || 'false' }}
+          MAX_JOBS_PER_RUN: ${{ vars.MAX_JOBS_PER_RUN || '40' }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.mode || 'run' }}" in
+            self-test) echo "Mode: self-test"; python job_agent.py --self-test ;;
+            dry-run)   echo "Mode: dry-run";   python job_agent.py --dry-run ;;
+            *)         echo "Mode: run";       python job_agent.py ;;
+          esac
 
       - name: Commit and push jobs_log.csv
+        if: ${{ (inputs.mode || 'run') == 'run' }}
         run: |
           set -euo pipefail
 
@@ -60,7 +91,7 @@ jobs:
           echo "Pushing to branch: $BRANCH"
 
           for i in 1 2 3; do
-            echo "Attempt $i: git pull --rebase origin $BRANCH"
+            echo "Attempt $i: git fetch + rebase + push"
             git fetch origin "$BRANCH"
             if git pull --rebase origin "$BRANCH"; then
               if git push origin "$BRANCH"; then
