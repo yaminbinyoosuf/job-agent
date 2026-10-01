@@ -214,6 +214,28 @@ NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or "yaminbinyoosuf@gmail.com"
 AUTO_APPLY = (os.environ.get("AUTO_APPLY") or "").strip().lower() in {"1", "true", "yes", "on"}
 # Only genuinely strong matches get a direct email to the company.
 AUTO_APPLY_MIN_SCORE = int(os.environ.get("AUTO_APPLY_MIN_SCORE") or 8)
+# Where a hiring manager's reply should land. Without this, replies to mail
+# sent from a shared sender domain never reach Yamin.
+OUTREACH_REPLY_TO = os.environ.get("OUTREACH_REPLY_TO") or os.environ.get(
+    "NOTIFY_EMAIL"
+) or "yaminbinyoosuf@gmail.com"
+
+
+def outreach_sender_ready() -> tuple[bool, str]:
+    """Direct outreach needs a sender on a domain the user controls.
+
+    Resend's shared onboarding@resend.dev sender can only deliver to the
+    account owner, and even where it is accepted a reply would go to Resend
+    rather than to Yamin — which defeats the point of the email."""
+    if DRY_RUN:
+        return False, "DRY_RUN is on"
+    if RESEND_FROM.strip().lower().endswith("@resend.dev"):
+        return False, (
+            "RESEND_FROM is still the shared resend.dev test sender. Verify a domain "
+            "at resend.com/domains, then set the RESEND_FROM secret to an address on "
+            "it (e.g. yamin@thryvixai.com). Direct outreach stays off until then."
+        )
+    return True, "ready"
 DRY_RUN = (os.environ.get("DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 COGEXT_API_KEY = os.environ.get("COGEXT_API_KEY") or ""
@@ -1112,15 +1134,29 @@ def score_and_draft_gemini_multi(client: "_genai.Client", models: list[str], job
 # ---------------------------------------------------------------------------
 
 
-def send_email_via_resend(api_key: str, subject: str, body: str, to: str | None = None) -> bool:
+def send_email_via_resend(
+    api_key: str,
+    subject: str,
+    body: str,
+    to: str | None = None,
+    reply_to: str | None = None,
+) -> bool:
     if DRY_RUN:
         print(f"  [DRY_RUN] would email {to or NOTIFY_EMAIL}: {subject}")
         return False
     recipient = to or NOTIFY_EMAIL
+    payload: dict[str, Any] = {
+        "from": RESEND_FROM,
+        "to": [recipient],
+        "subject": subject,
+        "text": body,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
     resp = _post(
         RESEND_API_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        payload={"from": RESEND_FROM, "to": [recipient], "subject": subject, "text": body},
+        payload=payload,
         retries=2,
         timeout=30,
     )
@@ -1391,24 +1427,21 @@ def self_test(resend_key: str) -> int:
         failures += 1
         print("  Resend not configured; skipping send.", file=sys.stderr)
 
-    # Can this account email anyone other than its owner? Resend blocks that
-    # until a domain is verified. delivered@resend.dev is Resend's own test
-    # sink, so this probe never sends real mail to a third party.
-    if resend_key and not DRY_RUN:
-        if send_email_via_resend(
-            resend_key,
-            "job-agent self-test: third-party delivery probe",
-            "Capability probe for AUTO_APPLY. No action needed.\n",
-            to="delivered@resend.dev",
-        ):
-            print("  Third-party sending: ENABLED — AUTO_APPLY can reach company contacts.")
-        else:
+    # Whether direct outreach can actually go out. Probing this against a real
+    # external address would mean emailing a stranger, and a resend.dev
+    # recipient proves nothing (it is Resend's own domain). So report the
+    # configuration condition that genuinely determines it.
+    if AUTO_APPLY:
+        ready, why = outreach_sender_ready()
+        if ready:
             print(
-                "  Third-party sending: BLOCKED — Resend only delivers to your own "
-                "address until a domain is verified. Verify one at resend.com/domains "
-                "and set the RESEND_FROM secret; until then AUTO_APPLY cannot send.",
-                file=sys.stderr,
+                f"  Direct outreach: READY — sending as {RESEND_FROM}, "
+                f"replies to {OUTREACH_REPLY_TO}"
             )
+        else:
+            print(f"  Direct outreach: DISABLED — {why}", file=sys.stderr)
+    else:
+        print("  Direct outreach: off (AUTO_APPLY not enabled)")
 
     print(f"== Self-test complete: {'FAILURES: ' + str(failures) if failures else 'all good'} ==")
     return 1 if failures else 0
@@ -1477,16 +1510,17 @@ def main() -> int:
         )
         return 1
 
+    direct_send_ok = False
     if AUTO_APPLY:
-        print(f"AUTO_APPLY is ON — direct outreach for scores >= {AUTO_APPLY_MIN_SCORE}")
-        if RESEND_FROM.endswith("@resend.dev"):
+        direct_send_ok, why = outreach_sender_ready()
+        if direct_send_ok:
             print(
-                "  WARNING: RESEND_FROM is still the shared resend.dev test sender. "
-                "Resend only delivers that to your own address, so direct outreach to "
-                "companies will be rejected. Verify a domain at resend.com/domains and "
-                "set the RESEND_FROM secret to an address on it.",
-                file=sys.stderr,
+                f"AUTO_APPLY is ON — direct outreach for scores >= "
+                f"{AUTO_APPLY_MIN_SCORE}; replies go to {OUTREACH_REPLY_TO}"
             )
+        else:
+            print(f"AUTO_APPLY is ON, but direct sending is disabled: {why}", file=sys.stderr)
+            print("  Every match and draft still arrives in your inbox.", file=sys.stderr)
 
     migrate_log_if_needed()
 
@@ -1577,14 +1611,20 @@ def main() -> int:
             # Optionally apply directly, but only to an address the posting
             # itself published, and only for genuinely strong matches.
             contact = job.get("contact_email")
-            if AUTO_APPLY and contact and emailed and score >= AUTO_APPLY_MIN_SCORE:
+            if AUTO_APPLY and direct_send_ok and contact and emailed and score >= AUTO_APPLY_MIN_SCORE:
                 direct_subject = result.get("email_subject") or subject
                 direct_body = (result.get("email_body") or "").strip()
                 if direct_body:
-                    if send_email_via_resend(resend_key, direct_subject, direct_body, to=contact):
+                    if send_email_via_resend(
+                        resend_key,
+                        direct_subject,
+                        direct_body,
+                        to=contact,
+                        reply_to=OUTREACH_REPLY_TO,
+                    ):
                         auto_applied += 1
                         print(f"    direct outreach sent to {contact}")
-            elif AUTO_APPLY and contact and emailed:
+            elif AUTO_APPLY and direct_send_ok and contact and emailed:
                 print(
                     f"    skipped direct send to {contact}: score {score} is below "
                     f"AUTO_APPLY_MIN_SCORE={AUTO_APPLY_MIN_SCORE}"

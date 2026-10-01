@@ -43,9 +43,29 @@ GitHub repo → **Settings → Secrets and variables → Actions → Variables**
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | Set to `deepseek-reasoner` for deeper scoring (slower, costlier) |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Fast, cheap model that scores every posting |
+| `DEEPSEEK_DRAFT_MODEL` | `deepseek-v4-pro` | Stronger reasoning model that rewrites the outreach **only for scoring matches**. Set to empty to disable the second pass |
 | `AUTO_APPLY` | `false` | See below |
+| `AUTO_APPLY_MIN_SCORE` | `8` | Score a posting needs before direct outreach is sent |
 | `MAX_JOBS_PER_RUN` | `40` | Caps API spend per run |
+
+### Why two models
+
+Measured on a real posting against this account:
+
+| Model | Time/job | Output tokens | Kind |
+| --- | --- | --- | --- |
+| `deepseek-chat` | 1.9s | 342 | standard |
+| `deepseek-flash` | 11s | 2,243 | reasoning |
+| `deepseek-v4-pro` | 31s | 3,264 | reasoning |
+
+Scoring every posting with a reasoning model costs ~10x the tokens and ~16x
+the time for no measurable gain in ranking. So `deepseek-chat` scores the full
+queue, and `deepseek-v4-pro` is spent only on the handful of postings that
+already cleared the threshold — where the quality of the actual email matters.
+`DEEPSEEK_MAX_TOKENS` defaults to 8000 because reasoning models spend the
+budget on `reasoning_content` *before* emitting an answer; too low a cap makes
+them return empty content.
 
 ### 3. Verify the wiring
 
@@ -89,17 +109,38 @@ All the knobs are near the top of `job_agent.py`:
 
 ## `AUTO_APPLY`
 
-Off by default, and deliberately so.
+Off by default, and gated on a verified sender.
 
 When `AUTO_APPLY=true`, the agent *additionally* sends the drafted outreach
-directly to a contact address **that the posting itself published**. Postings
-with no published contact still just go to your inbox.
+directly to a contact address **that the posting itself published**, but only
+when the posting scores at least `AUTO_APPLY_MIN_SCORE` (default 8). Postings
+with no published contact, or below that score, still just go to your inbox.
 
-This is the only path that emails a third party. Before turning it on, be aware
-that automated cold outreach can look like spam, can breach a job board's terms,
-and can burn a domain's sending reputation if it goes wrong. The agent only ever
-uses addresses the posting published for contact, and ignores
-`noreply@`/`privacy@`/`accessibility@`-style addresses.
+**This only works once you verify a domain.** Resend's shared
+`onboarding@resend.dev` sender can only deliver to your own account address.
+Even where it is accepted, a reply from a hiring manager would land at Resend
+instead of at you — which defeats the entire point. So the agent refuses to
+send direct outreach while `RESEND_FROM` is still a `resend.dev` address and
+tells you so at startup, rather than silently failing or sending from a
+spam-looking address.
+
+To turn it on properly:
+
+1. [resend.com/domains](https://resend.com/domains) → **Add Domain** →
+   `thryvixai.com` (or `cogextai.com`) → add the DNS records it shows.
+2. Set the `RESEND_FROM` secret to an address on that domain, e.g.
+   `yamin@thryvixai.com`.
+3. Run the **`self-test`** workflow — it prints
+   `Direct outreach: READY` when the wiring is good.
+
+Replies always go to `OUTREACH_REPLY_TO` (defaults to `NOTIFY_EMAIL`), so
+hiring managers reach you personally even when the mail is sent by the agent.
+
+Before enabling it, be aware that automated cold outreach can look like spam,
+can breach a job board's terms, and can hurt a domain's sending reputation.
+The agent only ever uses addresses a posting published for contact, and
+ignores `noreply@`, `privacy@`, `legal@`, `support@` and `accessibility@`
+style addresses.
 
 ## Free-tier limits
 
