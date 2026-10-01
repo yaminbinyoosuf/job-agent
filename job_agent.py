@@ -259,6 +259,7 @@ RESEND_API_URL = "https://api.resend.com/emails"
 RESEND_FROM = os.environ.get("RESEND_FROM") or "onboarding@resend.dev"
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or "yaminbinyoosuf@gmail.com"
 AUTO_APPLY = (os.environ.get("AUTO_APPLY") or "").strip().lower() in {"1", "true", "yes", "on"}
+DRY_RUN = (os.environ.get("DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
 # Only genuinely strong matches get a direct email to the company.
 AUTO_APPLY_MIN_SCORE = int(os.environ.get("AUTO_APPLY_MIN_SCORE") or 8)
 # Where a hiring manager's reply should land. Without this, replies to mail
@@ -283,7 +284,6 @@ def outreach_sender_ready() -> tuple[bool, str]:
             "it (e.g. yamin@thryvixai.com). Direct outreach stays off until then."
         )
     return True, "ready"
-DRY_RUN = (os.environ.get("DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 COGEXT_API_KEY = os.environ.get("COGEXT_API_KEY") or ""
 COGEXT_API_URL = "https://api.cogextai.com/api/v1"
@@ -302,7 +302,15 @@ LOG_FIELDS = [
     "score",
     "emailed",
     "reason",
+    "rubric",
 ]
+
+# Bump this whenever the scoring prompt, rubric or scoring model changes in a
+# way that could move a score. Rows logged under an older rubric and scored
+# below the threshold are re-evaluated once, so an improved rubric can rescue
+# postings the previous one underrated. Anything already emailed is never
+# re-sent, whatever the rubric.
+RUBRIC_VERSION = "2026-10-01.2"
 
 # ---------------------------------------------------------------------------
 # Candidate profile (built from Yamin_Bin_Yoosuf_Mercor_Final_Resume.docx)
@@ -1352,26 +1360,42 @@ def _row_emailed(row: dict) -> bool:
 def load_seen_job_ids() -> set[str]:
     """Job ids we have finished with.
 
-    A row counts as done only when a final decision was recorded. A scoring
-    error, or a strong match whose email never went out, must be retried."""
+    A row counts as done only when a final decision was recorded against the
+    current rubric. A scoring error, a strong match whose email never went out,
+    or a below-threshold score from an older rubric must all be revisited."""
     if not LOG_PATH.exists():
         return set()
     seen: set[str] = set()
-    with LOG_PATH.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            job_id = (row.get("job_id") or "").strip()
-            if not job_id:
-                continue
-            if (row.get("reason") or "").startswith("error:"):
-                continue
-            try:
-                score = int(float(row.get("score") or 0))
-            except ValueError:
-                score = 0
-            if score >= SCORE_THRESHOLD and not _row_emailed(row):
-                continue
+    for row in _read_log_rows():
+        job_id = (row.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        if (row.get("reason") or "").startswith("error:"):
+            continue
+        emailed = _row_emailed(row)
+        try:
+            score = int(float(row.get("score") or 0))
+        except ValueError:
+            score = 0
+        # Never re-send something already sent.
+        if emailed:
             seen.add(job_id)
+            continue
+        # A match whose email failed must be retried.
+        if score >= SCORE_THRESHOLD:
+            continue
+        # Below threshold, but judged by an older rubric: re-evaluate once.
+        if (row.get("rubric") or "") != RUBRIC_VERSION:
+            continue
+        seen.add(job_id)
     return seen
+
+
+def _read_log_rows() -> list[dict]:
+    if not LOG_PATH.exists():
+        return []
+    with LOG_PATH.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
 def append_log(rows: list[dict]) -> None:
@@ -1477,6 +1501,7 @@ def error_row(job: dict, exc: Exception) -> dict:
         "score": "",
         "emailed": False,
         "reason": f"error: {type(exc).__name__}: {exc}"[:400],
+        "rubric": "",
     }
 
 
@@ -1774,6 +1799,7 @@ def main() -> int:
                 "score": score,
                 "emailed": emailed,
                 "reason": reason,
+                "rubric": RUBRIC_VERSION,
             }
         )
 
