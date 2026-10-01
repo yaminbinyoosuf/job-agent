@@ -73,7 +73,8 @@ GitHub repo → **Settings → Secrets and variables → Actions → Variables**
 | `DEEPSEEK_DRAFT_MODEL` | `deepseek-v4-pro` | Stronger reasoning model that rewrites the outreach **only for scoring matches**. Set to empty to disable the second pass |
 | `AUTO_APPLY` | `false` | See below |
 | `AUTO_APPLY_MIN_SCORE` | `8` | Score a posting needs before direct outreach is sent |
-| `MAX_JOBS_PER_RUN` | `40` | Caps API spend per run |
+| `MAX_JOBS_PER_RUN` | `60` | Caps postings scored per run |
+| `MAX_STRONG_DRAFTS` | `6` | Caps reasoning-model rewrites per run — the single biggest cost lever |
 
 ### Why two models
 

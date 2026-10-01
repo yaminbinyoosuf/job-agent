@@ -288,6 +288,10 @@ DEEPSEEK_DRAFT_MODEL = (
     else "deepseek-v4-pro"
 )
 DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS") or 8000)
+# Reasoning models are the dominant cost per run (a draft costs roughly 10x a
+# scoring call), so cap how many are spent per run. Beyond the cap the bulk
+# model's draft is used, which is still perfectly serviceable.
+MAX_STRONG_DRAFTS = int(os.environ.get("MAX_STRONG_DRAFTS") or 6)
 
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL") or ""
 GEMINI_MODEL_PREFERENCES = [
@@ -1882,6 +1886,7 @@ def self_test(resend_key: str) -> int:
     print(f"  GEMINI_API_KEY:   {'set' if os.environ.get('GEMINI_API_KEY') else 'not set'}")
     print(f"  DEEPSEEK_MODEL:   {DEEPSEEK_MODEL}")
     print(f"  DRAFT_MODEL:      {DEEPSEEK_DRAFT_MODEL or '(disabled — bulk draft only)'}")
+    print(f"  Strong drafts/run:{MAX_STRONG_DRAFTS}")
     print(f"  RESEND_FROM:      {RESEND_FROM}")
     print(f"  NOTIFY_EMAIL:     {NOTIFY_EMAIL}")
     print(f"  AUTO_APPLY:       {AUTO_APPLY} (min score {AUTO_APPLY_MIN_SCORE})")
@@ -2080,6 +2085,7 @@ def main() -> int:
     log_rows: list[dict] = []
     emailed_count = 0
     auto_applied = 0
+    strong_drafts_used = 0
     last_gemini_call = 0.0
 
     for job in queue:
@@ -2128,7 +2134,9 @@ def main() -> int:
                 use_deepseek
                 and DEEPSEEK_DRAFT_MODEL
                 and DEEPSEEK_DRAFT_MODEL != DEEPSEEK_MODEL
+                and strong_drafts_used < MAX_STRONG_DRAFTS
             ):
+                strong_drafts_used += 1
                 try:
                     better = draft_email_deepseek(job, score, reason)
                     if (better.get("email_body") or "").strip():

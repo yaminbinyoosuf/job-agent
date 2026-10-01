@@ -64,6 +64,7 @@ jobs:
           AUTO_APPLY: ${{ vars.AUTO_APPLY || 'false' }}
           AUTO_APPLY_MIN_SCORE: ${{ vars.AUTO_APPLY_MIN_SCORE || '8' }}
           MAX_JOBS_PER_RUN: ${{ vars.MAX_JOBS_PER_RUN || '60' }}
+          MAX_STRONG_DRAFTS: ${{ vars.MAX_STRONG_DRAFTS || '6' }}
           # Task-based / no-interview targeting.
           NO_INTERVIEW_ONLY: ${{ vars.NO_INTERVIEW_ONLY || 'true' }}
           LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS || '72' }}
