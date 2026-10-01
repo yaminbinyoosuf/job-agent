@@ -26,7 +26,9 @@ concurrency:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Reasoning models (deepseek-v4-pro) can take ~30s per posting, so allow
+    # headroom well past the fast-model path.
+    timeout-minutes: 40
     steps:
       - name: Check out repo
         uses: actions/checkout@v4

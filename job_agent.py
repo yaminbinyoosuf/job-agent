@@ -21,7 +21,11 @@ Required environment variables:
     RESEND_API_KEY      Resend API key (email delivery)
 
 Optional environment variables:
-    DEEPSEEK_MODEL      Default: deepseek-chat (set deepseek-reasoner for depth)
+    DEEPSEEK_MODEL      Default: deepseek-chat. deepseek-v4-pro and
+                        deepseek-flash are reasoning models (slower, more
+                        tokens, generally stronger judgement).
+    DEEPSEEK_MAX_TOKENS Default: 8000. Must stay high for reasoning models,
+                        which spend the budget on reasoning before answering.
     RESEND_FROM         Default: onboarding@resend.dev (see README)
     NOTIFY_EMAIL        Default: yaminbinyoosuf@gmail.com
     GEMINI_API_KEY      Only used as a fallback if DEEPSEEK_API_KEY is absent
@@ -183,7 +187,7 @@ MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN") or 40)
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") or ""
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
-DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS") or 1200)
+DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS") or 8000)
 
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL") or ""
 GEMINI_MODEL_PREFERENCES = [
@@ -955,7 +959,20 @@ def score_and_draft_deepseek(job: dict) -> dict:
     if resp.status_code >= 400:
         raise RuntimeError(f"DeepSeek HTTP {resp.status_code}: {resp.text[:300]}")
     payload = resp.json()
-    raw = payload["choices"][0]["message"]["content"]
+    choice = payload["choices"][0]
+    message = choice.get("message") or {}
+    raw = (message.get("content") or "").strip()
+    if not raw:
+        # deepseek-v4-pro and deepseek-flash are reasoning models: they spend
+        # the token budget on reasoning_content first, so an exhausted budget
+        # surfaces as an empty content field instead of an HTTP error.
+        reasoning = message.get("reasoning_content") or ""
+        raise RuntimeError(
+            f"DeepSeek returned empty content (finish_reason={choice.get('finish_reason')}, "
+            f"reasoning_chars={len(reasoning)}, model={DEEPSEEK_MODEL}). "
+            f"Raise DEEPSEEK_MAX_TOKENS (currently {DEEPSEEK_MAX_TOKENS}) or use a "
+            "non-reasoning model such as deepseek-chat."
+        )
     result = _parse_json_response(raw)
     try:
         result["score"] = max(1, min(10, int(result.get("score", 0))))
