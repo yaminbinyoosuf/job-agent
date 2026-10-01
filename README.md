@@ -2,15 +2,15 @@
 
 An automated job hunter for Yamin Binyoosuf. Twice a day it:
 
-1. Pulls six free, key-less remote job feeds — **RemoteOK**, **WeWorkRemotely**
-   (programming + devops RSS), **Remotive**, **Arbeitnow**, **Jobicy**, and
-   **Hacker News "Who is hiring?"**.
+1. Pulls eight free, key-less remote job feeds — **RemoteOK**, **WeWorkRemotely**
+   (programming + devops RSS), **Remotive**, **Arbeitnow**, **Jobicy**,
+   **Himalayas**, **Working Nomads**, and **Hacker News "Who is hiring?"**.
 2. Normalizes and de-duplicates them, keeps postings inside the lookback
-   window, drops obviously non-engineering roles by title, then keeps postings
-   matching the keyword set.
+   window, drops non-engineering and out-of-reach seniority by title, then
+   requires keyword evidence in the title/tags (not just buried in the body).
 3. Scores each posting 1–10 with **DeepSeek** and drafts a personalized
    outreach email grounded in Yamin's real resume.
-4. For anything scoring 7+, emails the score, the reasoning, the apply link,
+4. For anything scoring 6+, emails the score, the reasoning, the apply link,
    any hiring contact published in the posting, and a ready-to-send outreach
    draft to `NOTIFY_EMAIL`.
 5. Logs every posting it looked at to `jobs_log.csv`, and skips job IDs it has
@@ -97,12 +97,16 @@ python job_agent.py               # the real thing
 
 All the knobs are near the top of `job_agent.py`:
 
-- `KEYWORDS` — positive match against title + description + tags.
-- `TITLE_BLOCKLIST` — roles dropped by title alone (sales, marketing,
-  accounting, recruiting, support, …). This saves DeepSeek calls on postings
-  that can never be a fit.
-- `SCORE_THRESHOLD` (7), `LOOKBACK_HOURS` (72), `MAX_JOBS_PER_RUN` (40) —
-  overridable by environment variable.
+- `KEYWORDS` — positive signal. A keyword in the title or board tags counts
+  double; body-only mentions need three to qualify, because a marketing post
+  that says "automation" is not an engineering job.
+- `TITLE_BLOCKLIST` / `GERMAN_TITLE_RE` — roles dropped by title alone (sales,
+  marketing, accounting, recruiting, support, designer, and
+  principal/staff/director/architect level). This saves DeepSeek calls on
+  postings that can never be a fit.
+- `SCORE_THRESHOLD` (6), `LOOKBACK_HOURS` (72), `MAX_JOBS_PER_RUN` (40) —
+  overridable by environment variable. 6 deliberately surfaces "worth a shot
+  with a real gap" roles, not just perfect matches.
 - `PROFILE` — built from `Yamin_Bin_Yoosuf_Mercor_Final_Resume.docx`. **Update
   this when the resume changes**; it drives both scoring and the drafted emails.
 - `EMAIL_TEMPLATE` — the tone/structure the drafts follow.
@@ -149,6 +153,7 @@ style addresses.
 - **DeepSeek**: pay-as-you-go and cheap, but not free. `deepseek-chat` costs a
   fraction of a cent per posting. A capped run of 40 postings is small change;
   lower `MAX_JOBS_PER_RUN` if you want a hard ceiling.
+- **Himalayas / Working Nomads / Jobicy / Remotive / Arbeitnow / WWR**: free, unauthenticated.
 - **Resend**: 100 emails/day, 3,000/month free. Until you verify your own
   domain you can only send **from** `onboarding@resend.dev` and only **to** the
   address on your Resend account — which is exactly how this is configured.

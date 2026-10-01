@@ -80,6 +80,8 @@ WWR_RSS_URLS = [
 REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
 ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api"
 JOBICY_API_URL = "https://jobicy.com/api/v2/remote-jobs?count=50"
+HIMALAYAS_API_URL = "https://himalayas.app/jobs/api?limit=100"
+WORKINGNOMADS_API_URL = "https://www.workingnomads.com/api/exposed_jobs/"
 HN_SEARCH_URL = (
     "https://hn.algolia.com/api/v1/search_by_date"
     "?query=%22Ask%20HN%3A%20Who%20is%20hiring%22&tags=story&hitsPerPage=5"
@@ -176,9 +178,54 @@ TITLE_BLOCKLIST = [
     "salesforce admin",
     "gis ",
     "salesforce consultant",
+    "manager",
+    # Seniority well beyond this candidate: these never convert.
+    "principal",
+    "staff engineer",
+    "staff software",
+    "staff product",
+    "staff security",
+    "staff data",
+    "staff machine",
+    "distinguished",
+    "director",
+    "head of",
+    "vp ",
+    "vice president",
+    "chief ",
+    "engineering manager",
+    "architect",
+    "fellow",
+    # Non-engineering functions that still slip through on keyword matches.
+    "analyst",
+    "specialist",
+    "consultant",
+    "advisor",
+    "strategist",
+    "coordinator",
+    "representative",
+    "administrator",
+    "instructional",
+    "curriculum",
+    "content developer",
+    "content manager",
+    "communications",
+    "public relations",
+    "designer",
+    "ux ",
+    " ui ",
 ]
 
-SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD") or 7)
+# German-language postings dominate Arbeitnow and almost never fit. Matches
+# the (m/w/d) style gender marker and a few unmistakable German words.
+GERMAN_TITLE_RE = re.compile(
+    r"\((?:m|w|f|d|x)\s*/\s*(?:m|w|f|d|x)(?:\s*/\s*(?:m|w|f|d|x))?\)"
+    r"|werkstudent|praktikant|berater|finanz|immobilien|mitarbeiter|für|"
+    r"ausbildung|bewerbung",
+    re.I,
+)
+
+SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD") or 6)
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS") or 72)
 MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN") or 40)
 
@@ -724,6 +771,69 @@ def fetch_jobicy_jobs() -> list[dict]:
     return jobs
 
 
+def fetch_himalayas_jobs() -> list[dict]:
+    """Himalayas exposes explicit seniority and location restrictions, which
+    are exactly the two filters this candidate cares about, so those are
+    carried through as tags for the scorer to see."""
+    data = _get(HIMALAYAS_API_URL)
+    jobs = []
+    for raw in (data or {}).get("jobs", []):
+        salary = ""
+        if raw.get("minSalary") or raw.get("maxSalary"):
+            salary = (
+                f"{raw.get('currency', '')} {raw.get('minSalary', '?')}-"
+                f"{raw.get('maxSalary', '?')} {raw.get('salaryPeriod', '')}"
+            ).strip()
+        locations = _as_list(raw.get("locationRestrictions")) or _as_list(
+            raw.get("timezoneRestrictions")
+        )
+        jobs.append(
+            _job(
+                source="Himalayas",
+                job_id=str(raw.get("guid") or raw.get("applicationLink") or raw.get("title")),
+                title=raw.get("title", ""),
+                company=raw.get("companyName", ""),
+                url=raw.get("applicationLink") or raw.get("guid") or "",
+                description=_clean_html(raw.get("description") or raw.get("excerpt")),
+                tags=(
+                    _as_list(raw.get("categories"))
+                    + _as_list(raw.get("parentCategories"))
+                    + _as_list(raw.get("seniority"))
+                    + _as_list(raw.get("employmentType"))
+                ),
+                location=", ".join(locations),
+                salary=salary,
+                posted_at=parse_date(raw.get("pubDate")),
+            )
+        )
+    return jobs
+
+
+def fetch_workingnomads_jobs() -> list[dict]:
+    """Working Nomads exposes a location string such as 'Anywhere in India',
+    which is a useful eligibility signal."""
+    data = _get(WORKINGNOMADS_API_URL)
+    jobs = []
+    for raw in data if isinstance(data, list) else []:
+        jobs.append(
+            _job(
+                source="Working Nomads",
+                job_id=str(raw.get("url") or raw.get("title")),
+                title=raw.get("title", ""),
+                company=raw.get("company_name", ""),
+                url=raw.get("url", ""),
+                description=_clean_html(raw.get("description")),
+                tags=[
+                    t.strip() for t in str(raw.get("tags") or "").split(",") if t.strip()
+                ]
+                + _as_list(raw.get("category_name")),
+                location=raw.get("location", ""),
+                posted_at=parse_date(raw.get("pub_date")),
+            )
+        )
+    return jobs
+
+
 def fetch_hn_jobs() -> list[dict]:
     """Hacker News 'Ask HN: Who is hiring?' — the newest monthly thread.
 
@@ -785,6 +895,8 @@ FETCHERS: list[tuple[str, Any]] = [
     ("Remotive", fetch_remotive_jobs),
     ("Arbeitnow", fetch_arbeitnow_jobs),
     ("Jobicy", fetch_jobicy_jobs),
+    ("Himalayas", fetch_himalayas_jobs),
+    ("Working Nomads", fetch_workingnomads_jobs),
     ("HN Who is hiring", fetch_hn_jobs),
 ]
 
@@ -793,25 +905,39 @@ FETCHERS: list[tuple[str, Any]] = [
 # Filtering
 # ---------------------------------------------------------------------------
 
-
-def _haystack(job: dict) -> str:
-    return " ".join(
-        [job.get("title", ""), job.get("description", ""), " ".join(job.get("tags", []) or [])]
-    ).lower()
-
-
 def title_is_blocked(job: dict) -> bool:
     title = f" {job.get('title', '').lower()} "
-    return any(bad in title for bad in TITLE_BLOCKLIST)
+    if any(bad in title for bad in TITLE_BLOCKLIST):
+        return True
+    return bool(GERMAN_TITLE_RE.search(title))
+
+
+def keyword_evidence(job: dict) -> tuple[int, int]:
+    """Return (strong, weak) keyword evidence.
+
+    Strong means the keyword appears in the title or the board's own tags,
+    which is what actually describes the role. Weak means it only appears
+    somewhere in the body text, which is usually incidental — a marketing
+    post mentioning "automation" is not an engineering job."""
+    title_tags = " ".join(
+        [job.get("title", ""), " ".join(job.get("tags", []) or [])]
+    ).lower()
+    description = (job.get("description") or "").lower()
+    strong = sum(1 for kw in KEYWORDS if kw in title_tags)
+    weak = sum(
+        1 for kw in KEYWORDS if kw not in title_tags and kw in description
+    )
+    return strong, weak
 
 
 def keyword_hits(job: dict) -> int:
-    hay = _haystack(job)
-    return sum(1 for kw in KEYWORDS if kw in hay)
+    strong, weak = keyword_evidence(job)
+    return strong * 2 + weak
 
 
 def matches_keywords(job: dict) -> bool:
-    return keyword_hits(job) > 0
+    strong, weak = keyword_evidence(job)
+    return strong >= 1 or weak >= 3
 
 
 def dedupe(jobs: list[dict]) -> list[dict]:
@@ -887,23 +1013,30 @@ Tags: {', '.join(job.get('tags', []) or [])}
 Description:
 {description}
 
-Give this candidate an honest fit score from 1 to 10. Judge real overlap, not keyword
-presence. Weigh these factors explicitly:
-- Required stack vs the candidate's actual stack (Python/FastAPI/PostgreSQL/React/LLM).
-- Seniority: they are early-career, self-taught, no degree, no big-team experience.
-  Staff/Principal/Lead/Head-of roles and "8+ years" requirements are poor fits.
-- Location and timezone eligibility from Kerala, India. Roles restricted to
-  US/UK/EU residency, or requiring fluent German/other local languages, are poor fits.
-- Whether the role is genuinely remote, and whether it is a real individual
-  contributor engineering role rather than sales/marketing/management.
-- Compensation: flag if it is clearly below a $25/hr remote contractor baseline.
-Score 8-10 only for roles where this candidate is a genuinely competitive applicant.
+Score this posting 1-10 on "should this candidate apply", using this scale:
+  9-10  Exceptional. Early-career-friendly AND the core stack matches almost exactly.
+  7-8   Strong. The core stack matches and seniority/location are plausible.
+        Worth applying to today.
+  5-6   Worth a shot, with a real gap (one missing technology, a seniority
+        stretch, or a location caveat worth asking about).
+  1-4   Not a good use of the candidate's time.
 
-Then draft a personalized outreach email under 150 words that follows the template's
-tone. Replace the [name/team] and [role] placeholders, and tie ONE or TWO of the
-candidate's specific shipped projects (THRYVIX AI clinic OS, COGEXT commitment
-infrastructure) to what this posting actually needs. Never invent experience the
-profile does not support. Sign off as Yamin Binyoosuf.
+Judge whether this candidate could realistically get an interview, NOT whether
+they satisfy every listed requirement. Postings list aspirational wishlists:
+treat "3+ years", "bonus points" and long technology lists as soft unless the
+posting stresses them. Do NOT penalise the candidate for having no degree, for
+being self-taught, or for working solo — those are strengths here.
+
+Cap the score at 3 if the posting requires residency or work authorisation the
+candidate cannot have (anything not open to worldwide or Asia-based
+contractors) or requires fluency in a language they do not speak.
+Cap the score at 5 if it demands 5+ years, or is staff/principal/director level.
+
+Then draft a personalized outreach email under 150 words that follows the
+template's tone. Replace the [name/team] and [role] placeholders, and tie ONE
+or TWO of the candidate's specific shipped projects (THRYVIX AI clinic OS,
+COGEXT commitment infrastructure) to what this posting actually needs. Never
+invent experience the profile does not support. Sign off as Yamin Binyoosuf.
 
 Respond with ONLY a JSON object, no prose, in exactly this shape:
 {{"score": <integer 1-10>,
