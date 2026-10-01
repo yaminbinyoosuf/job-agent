@@ -500,7 +500,10 @@ def _post(url: str, *, headers: dict, payload: dict, retries: int = 3, timeout: 
             time.sleep(1.5 * (attempt + 1))
             continue
         last = resp
-        if resp.status_code < 400 and resp.status_code != 429:
+        # 429 and 5xx are worth retrying; other 4xx (401 bad key, 402 no
+        # credit, 400 bad request) are permanent, so fail fast instead of
+        # burning the whole run on backoff.
+        if resp.status_code != 429 and resp.status_code < 500:
             return resp
         if attempt < retries - 1:
             print(f"    HTTP {resp.status_code}; retrying", file=sys.stderr)
@@ -876,6 +879,40 @@ def _parse_json_response(raw: str) -> dict:
     return json.loads(match.group(0))
 
 
+def check_deepseek_balance() -> tuple[bool, str]:
+    """Ask DeepSeek whether this key can actually spend money.
+
+    Uses DeepSeek's free /user/balance endpoint. This turns an opaque
+    'Insufficient Balance' 402 in the middle of a run into a clear
+    up-front message the user can act on."""
+    if not DEEPSEEK_API_KEY:
+        return False, "DEEPSEEK_API_KEY is not set"
+    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/user/balance"
+    try:
+        resp = _session.get(
+            url, headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}, timeout=20
+        )
+    except Exception as exc:  # noqa: BLE001
+        return True, f"balance check unreachable ({type(exc).__name__}); proceeding anyway"
+
+    if resp.status_code == 401:
+        return False, "API key rejected (HTTP 401) — check DEEPSEEK_API_KEY"
+    if resp.status_code >= 400:
+        return True, f"balance check returned HTTP {resp.status_code}; proceeding anyway"
+    try:
+        data = resp.json()
+    except ValueError:
+        return True, "balance response unreadable; proceeding anyway"
+
+    infos = data.get("balance_infos") or []
+    detail = ", ".join(
+        f"{i.get('currency', '')} {i.get('total_balance', '?')}".strip() for i in infos
+    )
+    if data.get("is_available") is False:
+        return False, f"account has no credit ({detail or 'balance is zero'})"
+    return True, detail or "available"
+
+
 def score_and_draft_deepseek(job: dict) -> dict:
     """Score a job and draft outreach with DeepSeek (JSON output mode)."""
     if not DEEPSEEK_API_KEY:
@@ -944,13 +981,32 @@ def pick_gemini_model(client: "_genai.Client") -> str:
 
 
 def score_and_draft_gemini(client: "_genai.Client", model: str, job: dict) -> dict:
-    response = client.models.generate_content(model=model, contents=_build_score_prompt(job))
-    result = _parse_json_response(response.text or "")
-    try:
-        result["score"] = max(1, min(10, int(result.get("score", 0))))
-    except (TypeError, ValueError):
-        result["score"] = 0
-    return result
+    """Gemini fallback. Retries transient 503/429 overload responses, which
+    the free tier returns often."""
+    last: Exception | None = None
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=model, contents=_build_score_prompt(job)
+            )
+            result = _parse_json_response(response.text or "")
+            try:
+                result["score"] = max(1, min(10, int(result.get("score", 0))))
+            except (TypeError, ValueError):
+                result["score"] = 0
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            text = str(exc)
+            transient = any(
+                marker in text for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
+            )
+            if not transient or attempt == 3:
+                raise
+            print(f"    Gemini transient error; backing off ({text[:80]})", file=sys.stderr)
+            time.sleep(4.0 * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1241,8 @@ def self_test(resend_key: str) -> int:
     print(f"  AUTO_APPLY:       {AUTO_APPLY}   DRY_RUN: {DRY_RUN}")
 
     if DEEPSEEK_API_KEY:
+        usable, status = check_deepseek_balance()
+        print(f"  DeepSeek balance: {status}")
         try:
             started = time.monotonic()
             result = score_and_draft_deepseek(probe)
@@ -1196,8 +1254,15 @@ def self_test(resend_key: str) -> int:
                 failures += 1
                 print("    but the draft body was empty", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
-            failures += 1
-            print(f"  DeepSeek call FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if not usable:
+                print(
+                    "  DeepSeek call skipped — the account has no credit. "
+                    "Top up at platform.deepseek.com to enable it.",
+                    file=sys.stderr,
+                )
+            else:
+                failures += 1
+                print(f"  DeepSeek call FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
     else:
         failures += 1
         print("  DeepSeek not configured; skipping call.", file=sys.stderr)
@@ -1256,23 +1321,40 @@ def main() -> int:
     use_deepseek = bool(DEEPSEEK_API_KEY)
     gemini_client = None
     gemini_model = None
-    if use_deepseek:
-        print(f"Engine: DeepSeek ({DEEPSEEK_MODEL})")
-    else:
+
+    def init_gemini() -> bool:
+        nonlocal gemini_client, gemini_model
         gemini_key = os.environ.get("GEMINI_API_KEY")
         if not gemini_key:
-            print("Set DEEPSEEK_API_KEY (preferred) or GEMINI_API_KEY", file=sys.stderr)
-            return 1
+            print("  GEMINI_API_KEY is not set", file=sys.stderr)
+            return False
         if _genai is None:
             print(
-                "google-genai is not installed; run: pip install google-genai "
-                "(or set DEEPSEEK_API_KEY to use DeepSeek)",
+                "  google-genai is not installed; run: pip install google-genai",
                 file=sys.stderr,
             )
-            return 1
+            return False
         gemini_client = _genai.Client(api_key=gemini_key)
         gemini_model = pick_gemini_model(gemini_client)
-        print(f"Engine: Gemini ({gemini_model})")
+        print(f"Engine: Gemini fallback ({gemini_model})")
+        return True
+
+    if use_deepseek:
+        usable, status = check_deepseek_balance()
+        if usable:
+            print(f"Engine: DeepSeek ({DEEPSEEK_MODEL}) — {status}")
+        else:
+            print(f"DeepSeek is not usable: {status}", file=sys.stderr)
+            print("Falling back to Gemini for this run.", file=sys.stderr)
+            use_deepseek = False
+
+    if not use_deepseek and not init_gemini():
+        print(
+            "No usable scoring engine. Top up DeepSeek (platform.deepseek.com) "
+            "or set GEMINI_API_KEY.",
+            file=sys.stderr,
+        )
+        return 1
 
     migrate_log_if_needed()
 
