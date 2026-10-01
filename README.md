@@ -2,17 +2,21 @@
 
 An automated job hunter for Yamin Binyoosuf. Twice a day it:
 
-1. Pulls eight free, key-less remote job feeds — **RemoteOK**, **WeWorkRemotely**
-   (programming + devops RSS), **Remotive**, **Arbeitnow**, **Jobicy**,
-   **Himalayas**, **Working Nomads**, and **Hacker News "Who is hiring?"**.
-2. Normalizes and de-duplicates them, keeps postings inside the lookback
-   window, drops non-engineering and out-of-reach seniority by title, then
-   requires keyword evidence in the title/tags (not just buried in the body).
+1. Pulls eleven feeds. Three of them carry **task-based / no-interview work**:
+   **Mercor** (paid AI-training tasks), **Freelancer.com** (bid on a project and
+   start), and the monthly **HN "Freelancer? Seeking freelancer?"** thread. The
+   rest are conventional boards: **RemoteOK**, **WeWorkRemotely**, **Remotive**,
+   **Arbeitnow**, **Jobicy**, **Himalayas**, **Working Nomads** and
+   **HN "Who is hiring?"**.
+2. Normalizes, de-duplicates, and **prioritises task work over contract over
+   full-time**, then applies the lookback window (72h for job postings, 90 days
+   for standing task/contract boards), drops non-engineering and out-of-reach
+   seniority by title, and requires keyword evidence in the title/tags.
 3. Scores each posting 1–10 with **DeepSeek** and drafts a personalized
    outreach email grounded in Yamin's real resume.
-4. For anything scoring 6+, emails the score, the reasoning, the apply link,
-   any hiring contact published in the posting, and a ready-to-send outreach
-   draft to `NOTIFY_EMAIL`.
+4. For anything scoring 6+ **that needs no interview**, emails the score, the
+   reasoning, the apply link or bid link, any hiring contact published in the
+   posting, and a ready-to-send outreach or bid proposal to `NOTIFY_EMAIL`.
 5. Logs every posting it looked at to `jobs_log.csv`, and skips job IDs it has
    already finished with on later runs.
 
@@ -20,6 +24,28 @@ An automated job hunter for Yamin Binyoosuf. Twice a day it:
 hiring manager's inbox. The agent emails the drafted outreach *to you* so you
 can send it through the real application channel within minutes of a posting
 going live. See `AUTO_APPLY` below for the one exception.
+
+## Task-based / no-interview targeting
+
+The candidate will not sit interviews. That is enforced, not merely preferred:
+
+- **Task and contract sources pass by nature.** Mercor pays per task or hour,
+  Freelancer.com is bid-and-start, and the HN freelancer thread is direct gig
+  contact — none of them run an interview loop.
+- **Mercor's own metadata decides.** Its board publishes
+  `interviewSchedulingEnabled`, `requiredInterviewConfigId` and
+  `interviewDuration`, so a listing that requires a human interview is dropped
+  before it is ever scored.
+- **Full-time postings must earn their way in.** The model returns an
+  `interview_process` of `none`, `light` or `standard`. A conventional role is
+  only emailed when it is `none` or `light` — a normal multi-round process is
+  discarded however good the stack match, and the run log says so.
+- **Location is checked too.** Mercor publishes `eligibleLocation`, so
+  USA-only listings are filtered out for an India-based contractor rather than
+  being scored and hoped for.
+
+Set `NO_INTERVIEW_ONLY=false` to see interview roles again (not recommended
+given the requirement).
 
 ## Setup
 
@@ -104,9 +130,16 @@ All the knobs are near the top of `job_agent.py`:
   marketing, accounting, recruiting, support, designer, and
   principal/staff/director/architect level). This saves DeepSeek calls on
   postings that can never be a fit.
-- `SCORE_THRESHOLD` (6), `LOOKBACK_HOURS` (72), `MAX_JOBS_PER_RUN` (40) —
-  overridable by environment variable. 6 deliberately surfaces "worth a shot
-  with a real gap" roles, not just perfect matches.
+- `SCORE_THRESHOLD` (6), `MAX_JOBS_PER_RUN` (60) — overridable by environment
+  variable. 6 deliberately surfaces "worth a shot with a real gap" roles.
+- `LOOKBACK_HOURS` (72) for job postings vs `LOOKBACK_HOURS_TASK` (2160, i.e.
+  90 days) for task/contract boards. Mercor and Freelancer are standing
+  catalogues of work that is still open, not a stream of new postings — the
+  job-feed window silently discarded 217 of 221 Mercor listings.
+- `FREELANCE_MIN_BUDGET` (50) and `FREELANCE_MAX_BIDS` (120) — Freelancer.com
+  noise floor. Budgets in other currencies are converted to a rough USD figure
+  first, otherwise cheap INR projects slip past a USD floor.
+- `NO_INTERVIEW_ONLY` (true) — see the targeting section above.
 - `PROFILE` — built from `Yamin_Bin_Yoosuf_Mercor_Final_Resume.docx`. **Update
   this when the resume changes**; it drives both scoring and the drafted emails.
 - `EMAIL_TEMPLATE` — the tone/structure the drafts follow.

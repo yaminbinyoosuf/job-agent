@@ -82,6 +82,16 @@ ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api"
 JOBICY_API_URL = "https://jobicy.com/api/v2/remote-jobs?count=50"
 HIMALAYAS_API_URL = "https://himalayas.app/jobs/api?limit=100"
 WORKINGNOMADS_API_URL = "https://www.workingnomads.com/api/exposed_jobs/"
+# Task-based / no-interview sources.
+MERCOR_JOBS_URL = "https://www.mercor.com/jobs"
+FREELANCER_API_URL = (
+    "https://www.freelancer.com/api/projects/0.1/projects/active/"
+    "?limit=100&job_details=true&full_description=true&sort_field=time_updated"
+)
+HN_FREELANCER_SEARCH_URL = (
+    "https://hn.algolia.com/api/v1/search_by_date"
+    "?query=%22Ask%20HN%3A%20Freelancer%3F%20Seeking%20freelancer%22&tags=story&hitsPerPage=5"
+)
 HN_SEARCH_URL = (
     "https://hn.algolia.com/api/v1/search_by_date"
     "?query=%22Ask%20HN%3A%20Who%20is%20hiring%22&tags=story&hitsPerPage=5"
@@ -214,6 +224,16 @@ TITLE_BLOCKLIST = [
     "designer",
     "ux ",
     " ui ",
+    # Mercor carries a lot of non-software domain-expert work.
+    "physicist",
+    "mechanical",
+    "civil engineer",
+    "chemical",
+    "biolog",
+    "pharmac",
+    "dentist",
+    "veterinar",
+    "geolog",
 ]
 
 # German-language postings dominate Arbeitnow and almost never fit. Matches
@@ -227,7 +247,33 @@ GERMAN_TITLE_RE = re.compile(
 
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD") or 6)
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS") or 72)
+# Standing task/contract boards (Mercor, Freelancer.com) are catalogs of work
+# that is still open, not a stream of new postings — a Mercor listing from a
+# month ago is usually still accepting applicants. Applying the freshness
+# window that suits job feeds would discard essentially all of it.
+LOOKBACK_HOURS_TASK = int(os.environ.get("LOOKBACK_HOURS_TASK") or 24 * 90)
 MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN") or 40)
+
+# --- Task / no-interview targeting -----------------------------------------
+
+# Only email postings that are task or contract work, or that the model
+# judges to carry no interview. This is the whole point for a candidate who
+# will not sit interviews.
+NO_INTERVIEW_ONLY = (os.environ.get("NO_INTERVIEW_ONLY") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Freelancer.com noise floor: skip tiny budgets and projects already buried
+# under a pile of bids, which nobody wins.
+FREELANCE_MIN_BUDGET = float(os.environ.get("FREELANCE_MIN_BUDGET") or 50)
+FREELANCE_MAX_BIDS = int(os.environ.get("FREELANCE_MAX_BIDS") or 120)
+# Remotive/Jobicy/etc. rate employment types like this; anything matching is
+# treated as contract rather than full-time.
+CONTRACT_TYPE_HINTS = ("contract", "contractor", "freelance", "temporary", "part_time")
+# Task work is surfaced before contract, which is surfaced before full-time.
+WORK_TYPE_RANK = {"task": 0, "contract": 1, "full_time": 2}
 
 # --- Engines ----------------------------------------------------------------
 
@@ -310,7 +356,7 @@ LOG_FIELDS = [
 # below the threshold are re-evaluated once, so an improved rubric can rescue
 # postings the previous one underrated. Anything already emailed is never
 # re-sent, whatever the rubric.
-RUBRIC_VERSION = "2026-10-01.2"
+RUBRIC_VERSION = "2026-10-02.1"
 
 # ---------------------------------------------------------------------------
 # Candidate profile (built from Yamin_Bin_Yoosuf_Mercor_Final_Resume.docx)
@@ -473,6 +519,19 @@ def _clean_html(raw: str | None) -> str:
     return text.strip()
 
 
+def _clean_markdown(raw: str | None) -> str:
+    """Light markdown strip for sources that publish descriptions as markdown
+    (Mercor), so the model sees prose rather than asterisks."""
+    if not raw:
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", raw)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-*]\s+", "- ", text)
+    text = re.sub(r"`{1,3}", "", text)
+    return text.strip()
+
+
 def extract_contact_email(text: str | None) -> str | None:
     """Return the first plausible hiring contact address in a posting."""
     if not text:
@@ -491,7 +550,17 @@ def extract_contact_email(text: str | None) -> str | None:
 
 
 def parse_date(value: Any) -> datetime | None:
-    """Best-effort parse of epoch seconds/millis, ISO-8601, or RFC-822."""
+    """Best-effort parse of epoch seconds/millis, ISO-8601, or RFC-822.
+
+    Always returns a timezone-aware UTC datetime: boards mix naive ISO strings
+    (Freelancer.com) with aware ones, and comparing the two raises TypeError."""
+    parsed = _parse_date_raw(value)
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _parse_date_raw(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
@@ -619,6 +688,14 @@ def _post(url: str, *, headers: dict, payload: dict, retries: int = 3, timeout: 
 # ---------------------------------------------------------------------------
 
 
+def _work_type_from_types(values: Iterable[str]) -> str:
+    """Map a board's own employment-type strings onto our work types."""
+    blob = " ".join(str(v).lower() for v in values if v)
+    if any(hint in blob for hint in CONTRACT_TYPE_HINTS):
+        return "contract"
+    return "full_time"
+
+
 def _job(
     *,
     source: str,
@@ -631,6 +708,9 @@ def _job(
     location: str = "",
     salary: str = "",
     posted_at: datetime | None = None,
+    work_type: str = "full_time",
+    no_interview: bool | None = None,
+    competition: int | None = None,
 ) -> dict:
     description = (description or "").strip()
     return {
@@ -645,6 +725,14 @@ def _job(
         "salary": (salary or "").strip(),
         "posted_at": posted_at,
         "contact_email": extract_contact_email(description),
+        # "task"     — paid per task/project, claim or bid on it, no interview
+        # "contract" — fixed-term contract, usually a light screen at most
+        # "full_time" — standard employment, normally a full interview loop
+        "work_type": work_type,
+        # True/False when the source states it outright; None when unknown.
+        "no_interview": no_interview,
+        # Competing applicants, where the source exposes it (Freelancer bids).
+        "competition": competition,
     }
 
 
@@ -670,6 +758,7 @@ def fetch_remoteok_jobs() -> list[dict]:
                 location=raw.get("location", ""),
                 salary=salary,
                 posted_at=parse_date(raw.get("epoch")) or parse_date(raw.get("date")),
+                work_type=_work_type_from_types(_as_list(raw.get("tags"))),
             )
         )
     return jobs
@@ -724,6 +813,7 @@ def fetch_remotive_jobs() -> list[dict]:
                 location=raw.get("candidate_required_location", ""),
                 salary=raw.get("salary", ""),
                 posted_at=parse_date(raw.get("publication_date")),
+                work_type=_work_type_from_types([raw.get("job_type")]),
             )
         )
     return jobs
@@ -747,6 +837,7 @@ def fetch_arbeitnow_jobs() -> list[dict]:
                 tags=_as_list(raw.get("tags")) + _as_list(raw.get("job_types")),
                 location=raw.get("location", ""),
                 posted_at=parse_date(raw.get("created_at")),
+                work_type=_work_type_from_types(_as_list(raw.get("job_types"))),
             )
         )
     return jobs
@@ -774,6 +865,7 @@ def fetch_jobicy_jobs() -> list[dict]:
                 location=raw.get("jobGeo", ""),
                 salary=salary,
                 posted_at=parse_date(raw.get("pubDate")),
+                work_type=_work_type_from_types(_as_list(raw.get("jobType"))),
             )
         )
     return jobs
@@ -812,6 +904,7 @@ def fetch_himalayas_jobs() -> list[dict]:
                 location=", ".join(locations),
                 salary=salary,
                 posted_at=parse_date(raw.get("pubDate")),
+                work_type=_work_type_from_types(_as_list(raw.get("employmentType"))),
             )
         )
     return jobs
@@ -897,7 +990,240 @@ def fetch_hn_jobs() -> list[dict]:
     return jobs
 
 
+# ---------------------------------------------------------------------------
+# Task-based / no-interview sources
+# ---------------------------------------------------------------------------
+
+_LOCATION_OK_TOKENS = ("india", "asia", "apac", "anywhere", "worldwide", "global", "remote")
+
+# Rough static rates, only used to apply a USD-equivalent freelance floor.
+# Deliberately approximate: this is a noise filter, not accounting.
+_CURRENCY_TO_USD = {
+    "USD": 1.0,
+    "EUR": 1.08,
+    "GBP": 1.27,
+    "INR": 0.012,
+    "AUD": 0.66,
+    "CAD": 0.73,
+    "SGD": 0.74,
+    "NZD": 0.60,
+    "PLN": 0.25,
+    "CHF": 1.12,
+    "SEK": 0.095,
+    "ZAR": 0.054,
+    "BRL": 0.18,
+    "MXN": 0.050,
+    "PHP": 0.017,
+    "PKR": 0.0036,
+    "BDT": 0.0084,
+    "NGN": 0.00065,
+}
+
+
+def location_allows_candidate(eligible: list[str], ineligible: list[str]) -> bool:
+    """Whether a posting's stated location restrictions leave room for an
+    India-based remote contractor. An empty `eligible` list means no stated
+    restriction."""
+    if any("india" in item.lower() for item in ineligible):
+        return False
+    if not eligible:
+        return True
+    return any(
+        any(token in item.lower() for token in _LOCATION_OK_TOKENS) for item in eligible
+    )
+
+
+def fetch_mercor_jobs() -> list[dict]:
+    """Mercor — task-based AI-training work, paid hourly per engagement.
+
+    Mercor publishes its board as a server-rendered Next.js payload, so the
+    listings are read from __NEXT_DATA__ rather than a private API. The board
+    also carries explicit interview metadata, which is what makes it worth
+    parsing: `interviewSchedulingEnabled`, `requiredInterviewConfigId` and
+    `interviewDuration` together tell us whether a human interview happens."""
+    content = _get(MERCOR_JOBS_URL, as_json=False)
+    text = content.decode("utf-8", "replace") if isinstance(content, bytes) else str(content)
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', text, re.S)
+    if not match:
+        raise RuntimeError("Mercor page had no __NEXT_DATA__ payload (layout changed?)")
+    data = json.loads(match.group(1))
+    queries = (
+        ((data.get("props") or {}).get("pageProps") or {}).get("dehydratedState") or {}
+    ).get("queries") or []
+    listings: list[dict] = []
+    for query in queries:
+        found = ((query.get("state") or {}).get("data") or {}).get("listings")
+        if found:
+            listings = found
+            break
+    if not listings:
+        raise RuntimeError("Mercor payload contained no listings")
+
+    jobs: list[dict] = []
+    for raw in listings:
+        if str(raw.get("status") or "").lower() != "active":
+            continue
+        if str(raw.get("deletedAt") or "None") not in {"None", "", "none"}:
+            continue
+        eligible = _as_list(raw.get("eligibleLocation"))
+        ineligible = _as_list(raw.get("ineligibleLocation")) + _as_list(
+            raw.get("ineligibleResidenceLocation")
+        )
+        if not location_allows_candidate(eligible, ineligible):
+            continue
+
+        # No human interview when scheduling is off and no interview config
+        # or duration is attached to the listing.
+        interviews_off = (
+            str(raw.get("interviewSchedulingEnabled")) == "False"
+            and str(raw.get("requiredInterviewConfigId")) == "None"
+            and str(raw.get("interviewDuration")) == "None"
+        )
+        rate = ""
+        if raw.get("rateMin") or raw.get("rateMax"):
+            frequency = raw.get("payRateFrequency") or "hourly"
+            rate = f"${raw.get('rateMin', '?')}-${raw.get('rateMax', '?')}/{frequency}"
+        listing_id = str(raw.get("listingId") or raw.get("uid") or "")
+        slug = re.sub(r"[^a-z0-9]+", "-", (raw.get("title") or "").lower()).strip("-")
+        jobs.append(
+            _job(
+                source="Mercor",
+                job_id=listing_id,
+                title=raw.get("title", ""),
+                company=raw.get("companyName") or "Mercor client",
+                url=f"https://work.mercor.com/jobs/{listing_id}/{slug}",
+                description=_clean_markdown(raw.get("description") or ""),
+                tags=_as_list(raw.get("listingDomain")) + _as_list(raw.get("commitment")),
+                location=", ".join(eligible) or "Remote",
+                salary=rate,
+                posted_at=parse_date(raw.get("postedAt") or raw.get("createdAt")),
+                work_type="task",
+                no_interview=interviews_off,
+            )
+        )
+    return jobs
+
+
+def fetch_freelancer_jobs() -> list[dict]:
+    """Freelancer.com — bid-based project work with no interview at all.
+
+    Uses their public projects API. The API's `query` parameter is a fuzzy
+    search rather than a filter, so relevance is left to the shared keyword
+    prefilter and only budget/competition are filtered here."""
+    data = _get(FREELANCER_API_URL)
+    projects = ((data or {}).get("result") or {}).get("projects") or []
+    jobs: list[dict] = []
+    for raw in projects:
+        budget = raw.get("budget") or {}
+        currency = ((raw.get("currency") or {}).get("code") or "").upper()
+        low = float(budget.get("minimum") or 0)
+        high = float(budget.get("maximum") or 0)
+        # Compare every currency against the floor in USD, otherwise a low INR
+        # project sails past a floor meant to filter exactly that.
+        rate = _CURRENCY_TO_USD.get(currency)
+        if rate is not None and max(low, high) * rate < FREELANCE_MIN_BUDGET:
+            continue
+        bids = int((raw.get("bid_stats") or {}).get("bid_count") or 0)
+        if bids > FREELANCE_MAX_BIDS:
+            continue
+
+        amount = ""
+        if low or high:
+            amount = f"{currency} {low:g}-{high:g}".strip()
+            if rate is not None:
+                amount += f" (~${max(low, high) * rate:,.0f})"
+        if bids:
+            amount = f"{amount} · {bids} bids".strip(" ·")
+
+        seo = raw.get("seo_url") or ""
+        url = f"https://www.freelancer.com/projects/{seo}" if seo else ""
+        jobs.append(
+            _job(
+                source="Freelancer.com",
+                job_id=str(raw.get("id")),
+                title=raw.get("title", ""),
+                company="Freelancer.com client",
+                url=url,
+                description=_clean_html(
+                    raw.get("description") or raw.get("preview_description")
+                ),
+                tags=[str(s.get("name")) for s in (raw.get("jobs") or []) if s.get("name")]
+                + [str(raw.get("type") or "")],
+                location="Remote",
+                salary=amount,
+                posted_at=parse_date(raw.get("time_submitted") or raw.get("time_updated")),
+                work_type="task",
+                no_interview=True,
+                competition=bids,
+            )
+        )
+    return jobs
+
+
+def fetch_hn_freelancer_jobs() -> list[dict]:
+    """The monthly 'Ask HN: Freelancer? Seeking freelancer?' thread.
+
+    Top-level comments lead with either SEEKING FREELANCER (someone hiring —
+    a lead) or SEEKING WORK (another freelancer — a competitor). Only the
+    first kind is kept."""
+    listing = _get(HN_FREELANCER_SEARCH_URL)
+    story = next(
+        (
+            hit
+            for hit in (listing or {}).get("hits", [])
+            if (hit.get("title") or "").startswith("Ask HN: Freelancer?")
+        ),
+        None,
+    )
+    if not story:
+        return []
+    story_id = str(story["objectID"])
+    jobs: list[dict] = []
+    nb_pages = 1
+    for page in range(HN_MAX_PAGES):
+        if page >= nb_pages:
+            break
+        data = _get(
+            f"https://hn.algolia.com/api/v1/search"
+            f"?tags=comment,story_{story_id}&hitsPerPage=100&page={page}"
+        )
+        nb_pages = int((data or {}).get("nbPages") or 1)
+        hits = (data or {}).get("hits", [])
+        if not hits:
+            break
+        for hit in hits:
+            if str(hit.get("parent_id")) != story_id:
+                continue
+            text = _clean_html(hit.get("comment_text"))
+            upper = text.upper()
+            if "SEEKING FREELANCER" not in upper:
+                continue  # SEEKING WORK posts are competitors, not leads
+            first_line = text.split("\n", 1)[0][:220]
+            company, sep, title = first_line.partition("|")
+            if not sep:
+                company, title = "HN client", first_line
+            jobs.append(
+                _job(
+                    source="HN Freelancer",
+                    job_id=str(hit.get("objectID")),
+                    title=title.strip(" |") or "Freelance engagement",
+                    company=company.strip(" |"),
+                    url=f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+                    description=text,
+                    posted_at=parse_date(hit.get("created_at")),
+                    work_type="task",
+                    no_interview=True,
+                )
+            )
+        time.sleep(0.3)
+    return jobs
+
+
 FETCHERS: list[tuple[str, Any]] = [
+    # Task-based / no-interview work first — this is what gets prioritised.
+    ("Mercor", fetch_mercor_jobs),
+    ("Freelancer.com", fetch_freelancer_jobs),
+    ("HN Freelancer", fetch_hn_freelancer_jobs),
     ("RemoteOK", fetch_remoteok_jobs),
     ("WeWorkRemotely", fetch_wwr_jobs),
     ("Remotive", fetch_remotive_jobs),
@@ -968,30 +1294,45 @@ def dedupe(jobs: list[dict]) -> list[dict]:
 
 
 def select_candidates(jobs: list[dict]) -> list[dict]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    now = datetime.now(timezone.utc)
+    # Task and contract boards are standing catalogs and get a much longer
+    # window than time-sensitive full-time job postings.
+    cutoff_fresh = now - timedelta(hours=LOOKBACK_HOURS)
+    cutoff_standing = now - timedelta(hours=LOOKBACK_HOURS_TASK)
     picked = []
     for job in jobs:
+        work_type = job.get("work_type", "full_time")
+        cutoff = cutoff_standing if work_type in ("task", "contract") else cutoff_fresh
         posted_at = job.get("posted_at")
         if posted_at is not None:
             if posted_at.tzinfo is None:
                 posted_at = posted_at.replace(tzinfo=timezone.utc)
             if posted_at < cutoff:
                 continue
+        # The source stated outright that this one runs interviews: not wanted.
+        if job.get("no_interview") is False:
+            continue
         if title_is_blocked(job):
             continue
         if not matches_keywords(job):
             continue
         picked.append(job)
 
-    # Freshest + strongest keyword overlap first, so a capped run spends its
-    # API budget on the best postings.
+    # Task work first, then contract, then full-time. Within a work type: best
+    # keyword overlap, then least contested, then freshest — so a capped run
+    # spends its API budget on the work that is actually wanted.
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def sort_key(job: dict):
         posted = job.get("posted_at") or epoch
         if posted.tzinfo is None:
             posted = posted.replace(tzinfo=timezone.utc)
-        return (-keyword_hits(job), -posted.timestamp())
+        return (
+            WORK_TYPE_RANK.get(job.get("work_type", "full_time"), 2),
+            -keyword_hits(job),
+            job.get("competition") or 0,
+            -posted.timestamp(),
+        )
 
     return sorted(picked, key=sort_key)
 
@@ -1016,39 +1357,52 @@ Source: {job.get('source', '')}
 Title: {job.get('title', '')}
 Company: {job.get('company', '')}
 Location: {job.get('location', '')}
-Salary: {job.get('salary', '')}
+Rate/budget: {job.get('salary', '')}
 Tags: {', '.join(job.get('tags', []) or [])}
+Work type: {job.get('work_type', 'full_time')}
 Description:
 {description}
 
-Score this posting 1-10 on "should this candidate apply", using this scale:
-  9-10  Exceptional. Early-career-friendly AND the core stack matches almost exactly.
-  7-8   Strong. The core stack matches and seniority/location are plausible.
-        Worth applying to today.
-  5-6   Worth a shot, with a real gap (one missing technology, a seniority
-        stretch, or a location caveat worth asking about).
-  1-4   Not a good use of the candidate's time.
+HARD REQUIREMENT FROM THE CANDIDATE: they will NOT sit job interviews. They
+want task-based or project-based work they can simply start, or contract work
+with no interview loop. A conventional full-time role is acceptable ONLY if
+the posting genuinely indicates no interview (for example "no interview",
+"no whiteboard", "paid trial task", "take-home only", or "start immediately").
+A normal multiple-round interview process is useless to them however good the
+stack match is.
 
-Judge whether this candidate could realistically get an interview, NOT whether
+Score this posting 1-10 on "should this candidate take this on", using this scale:
+  9-10  Task/project work they can start now, squarely within their stack.
+  7-8   Task or contract work with strong stack overlap, or a no-interview
+        full-time role that fits well.
+  5-6   Plausible, with a real gap (adjacent stack, modest budget, or a
+        "worth asking" location caveat).
+  1-4   Not worth their time.
+
+Judge whether this candidate could actually win and do this work, NOT whether
 they satisfy every listed requirement. Postings list aspirational wishlists:
 treat "3+ years", "bonus points" and long technology lists as soft unless the
-posting stresses them. Do NOT penalise the candidate for having no degree, for
-being self-taught, or for working solo — those are strengths here.
+posting stresses them. Do NOT penalise them for having no degree, for being
+self-taught, or for working solo — those are strengths here.
 
-Cap the score at 3 if the posting requires residency or work authorisation the
-candidate cannot have (anything not open to worldwide or Asia-based
-contractors) or requires fluency in a language they do not speak.
+Cap the score at 4 if it is a conventional full-time role with a normal
+interview process (multiple rounds, live coding, or a panel).
+Cap the score at 3 if it requires residency or work authorisation the
+candidate cannot have, or fluency in a language they do not speak.
 Cap the score at 5 if it demands 5+ years, or is staff/principal/director level.
 
-Then draft a personalized outreach email under 150 words that follows the
-template's tone. Replace the [name/team] and [role] placeholders, and tie ONE
-or TWO of the candidate's specific shipped projects (THRYVIX AI clinic OS,
-COGEXT commitment infrastructure) to what this posting actually needs. Never
+Then draft the outreach. For task/project work this is a short proposal to win
+the work; for a job it is a short application email. Under 150 words, following
+the template's tone. Replace the [name/team] and [role] placeholders, and tie
+ONE or TWO of the candidate's specific shipped projects (THRYVIX AI clinic OS,
+COGEXT commitment infrastructure) to what the posting actually needs. Never
 invent experience the profile does not support. Sign off as Yamin Binyoosuf.
 
 Respond with ONLY a JSON object, no prose, in exactly this shape:
 {{"score": <integer 1-10>,
   "reason": "<one or two sentences explaining the score, naming the decisive factor>",
+  "interview_process": "<one of: none | light | standard>",
+  "work_type": "<one of: task | contract | full_time>",
   "email_subject": "<subject line under 80 characters>",
   "email_body": "<the outreach email, plain text, with real newlines>"}}"""
 
@@ -1457,14 +1811,19 @@ def build_match_email(job: dict, result: dict) -> tuple[str, str]:
     contact = job.get("contact_email")
     lines = [
         f"Match score: {score}/10",
+        f"Work type:   {(result.get('work_type') or job.get('work_type') or '').upper()}"
+        f"  |  interview: {result.get('interview_process') or 'n/a'}",
         f"Role:        {job.get('title')}",
         f"Company:     {job.get('company')}",
         f"Source:      {job.get('source')}",
+        f"Posted:      {job['posted_at'].strftime('%Y-%m-%d %H:%M UTC') if job.get('posted_at') else 'unknown'}",
     ]
     if job.get("location"):
         lines.append(f"Location:    {job['location']}")
     if job.get("salary"):
-        lines.append(f"Salary:      {job['salary']}")
+        lines.append(f"Rate/budget: {job['salary']}")
+    if job.get("competition"):
+        lines.append(f"Competition: {job['competition']} other applicants")
     lines += [
         f"Apply:       {job.get('url')}",
     ]
@@ -1485,9 +1844,12 @@ def build_match_email(job: dict, result: dict) -> tuple[str, str]:
         "=" * 68,
     ]
     if job.get("description"):
-        snippet = job["description"][:1200]
+        snippet = job["description"][:1600]
         lines += ["POSTING EXCERPT", "-" * 68, snippet, ""]
-    return f"[{score}/10] {job.get('title')} @ {job.get('company')}", "\n".join(lines)
+    headline = f"[{score}/10] {job.get('title')} @ {job.get('company')}"
+    if (job.get("work_type") or "full_time") == "task":
+        headline = f"[TASK] {headline}"
+    return headline, "\n".join(lines)
 
 
 def error_row(job: dict, exc: Exception) -> dict:
@@ -1524,6 +1886,14 @@ def self_test(resend_key: str) -> int:
     print(f"  NOTIFY_EMAIL:     {NOTIFY_EMAIL}")
     print(f"  AUTO_APPLY:       {AUTO_APPLY} (min score {AUTO_APPLY_MIN_SCORE})")
     print(f"  DRY_RUN:          {DRY_RUN}")
+    print(
+        f"  NO_INTERVIEW_ONLY:{NO_INTERVIEW_ONLY}  "
+        f"(task/contract always pass; full-time needs none/light interview)"
+    )
+    print(
+        f"  Freelance floor:  min ${FREELANCE_MIN_BUDGET:g} USD budget, "
+        f"max {FREELANCE_MAX_BIDS} rival bids"
+    )
 
     if DEEPSEEK_API_KEY:
         usable, status = check_deepseek_balance()
@@ -1736,8 +2106,22 @@ def main() -> int:
         reason = str(result.get("reason", ""))[:400]
         print(f"  [{score}/10] {title} @ {company} — {reason[:100]}")
 
+        # The candidate will not sit interviews. Task and contract work passes
+        # by its nature; a full-time posting has to show no interview in its
+        # own text before it is worth sending.
+        model_work_type = str(result.get("work_type") or "").strip().lower()
+        work_type = job.get("work_type") or "full_time"
+        if model_work_type in WORK_TYPE_RANK and work_type == "full_time":
+            work_type = model_work_type
+        interview_process = str(result.get("interview_process") or "").strip().lower()
+        no_interview_ok = (
+            not NO_INTERVIEW_ONLY
+            or work_type in ("task", "contract")
+            or interview_process in ("none", "light")
+        )
+
         emailed = False
-        if score >= SCORE_THRESHOLD:
+        if score >= SCORE_THRESHOLD and no_interview_ok:
             # Second pass: let the stronger model rewrite the outreach. Only
             # runs for matches, so the expensive model is used sparingly.
             if (
@@ -1787,6 +2171,11 @@ def main() -> int:
                     f"    skipped direct send to {contact}: score {score} is below "
                     f"AUTO_APPLY_MIN_SCORE={AUTO_APPLY_MIN_SCORE}"
                 )
+        elif score >= SCORE_THRESHOLD:
+            print(
+                f"    skipped: scored {score} but it needs "
+                f"{interview_process or 'a standard'} interview — you asked for none"
+            )
 
         log_rows.append(
             {

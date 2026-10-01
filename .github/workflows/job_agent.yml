@@ -63,7 +63,13 @@ jobs:
           COGEXT_API_KEY: ${{ secrets.COGEXT_API_KEY }}
           AUTO_APPLY: ${{ vars.AUTO_APPLY || 'false' }}
           AUTO_APPLY_MIN_SCORE: ${{ vars.AUTO_APPLY_MIN_SCORE || '8' }}
-          MAX_JOBS_PER_RUN: ${{ vars.MAX_JOBS_PER_RUN || '40' }}
+          MAX_JOBS_PER_RUN: ${{ vars.MAX_JOBS_PER_RUN || '60' }}
+          # Task-based / no-interview targeting.
+          NO_INTERVIEW_ONLY: ${{ vars.NO_INTERVIEW_ONLY || 'true' }}
+          LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS || '72' }}
+          LOOKBACK_HOURS_TASK: ${{ vars.LOOKBACK_HOURS_TASK || '2160' }}
+          FREELANCE_MIN_BUDGET: ${{ vars.FREELANCE_MIN_BUDGET || '50' }}
+          FREELANCE_MAX_BIDS: ${{ vars.FREELANCE_MAX_BIDS || '120' }}
         run: |
           set -euo pipefail
           case "${{ inputs.mode || 'run' }}" in
