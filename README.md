@@ -164,7 +164,10 @@ style addresses.
 - `job_agent.py` — the agent
 - `requirements.txt` — Python deps
 - `.github/workflows/job_agent.yml` — schedule + manual dispatch
-- `jobs_log.csv` — every posting seen, so re-runs don't re-score or re-email
+- `jobs_log.csv` — every posting seen, so re-runs don't re-score or re-email.
+  Each row records the `rubric` version that judged it, so bumping
+  `RUBRIC_VERSION` after a scoring change re-evaluates postings the old
+  rubric may have underrated (already-emailed postings are never re-sent)
 
 ## Troubleshooting
 
