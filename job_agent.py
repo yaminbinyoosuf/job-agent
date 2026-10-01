@@ -317,6 +317,18 @@ yaminbinyoosuf@gmail.com | +91 8304881059
 # Small helpers
 # ---------------------------------------------------------------------------
 
+# Minimal synthetic posting used to probe engine health.
+PROBE_JOB = {
+    "id": "self-test:1",
+    "title": "Backend Engineer (FastAPI / LLM)",
+    "company": "Self-test Co",
+    "description": "Build FastAPI services and LLM agent workflows in Python.",
+    "source": "self-test",
+    "tags": ["python", "fastapi", "llm"],
+    "location": "Remote (worldwide)",
+    "salary": "",
+}
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 # Addresses that exist in postings but are the wrong destination for an
 # application (accommodation requests, legal, abuse desks, placeholders).
@@ -952,39 +964,13 @@ def score_and_draft_deepseek(job: dict) -> dict:
     return result
 
 
-def pick_gemini_model(client: "_genai.Client") -> str:
-    """Pick a Gemini model this key can actually call."""
-    available: set[str] = set()
-    try:
-        for model in client.models.list():
-            name = (model.name or "").removeprefix("models/")
-            methods = (
-                getattr(model, "supported_actions", None)
-                or getattr(model, "supported_generation_methods", None)
-                or []
-            )
-            if "generateContent" in methods or not methods:
-                available.add(name)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  Model listing failed ({exc}); trying preferred model as-is.", file=sys.stderr)
-
-    if GEMINI_MODEL_ENV:
-        if not available or GEMINI_MODEL_ENV in available:
-            return GEMINI_MODEL_ENV
-        print(f"  GEMINI_MODEL='{GEMINI_MODEL_ENV}' not in ListModels; using it anyway.", file=sys.stderr)
-        return GEMINI_MODEL_ENV
-
-    for candidate in GEMINI_MODEL_PREFERENCES:
-        if candidate in available:
-            return candidate
-    return GEMINI_MODEL_PREFERENCES[0]
-
-
-def score_and_draft_gemini(client: "_genai.Client", model: str, job: dict) -> dict:
+def score_and_draft_gemini(
+    client: "_genai.Client", model: str, job: dict, attempts: int = 3
+) -> dict:
     """Gemini fallback. Retries transient 503/429 overload responses, which
     the free tier returns often."""
     last: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(attempts):
         try:
             response = client.models.generate_content(
                 model=model, contents=_build_score_prompt(job)
@@ -999,12 +985,55 @@ def score_and_draft_gemini(client: "_genai.Client", model: str, job: dict) -> di
             last = exc
             text = str(exc)
             transient = any(
-                marker in text for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
+                marker in text
+                for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
             )
-            if not transient or attempt == 3:
+            if not transient or attempt == attempts - 1:
                 raise
             print(f"    Gemini transient error; backing off ({text[:80]})", file=sys.stderr)
-            time.sleep(4.0 * (attempt + 1))
+            time.sleep(3.0 * (attempt + 1))
+    assert last is not None
+    raise last
+
+
+def select_working_gemini_model(client: "_genai.Client", probe_job: dict) -> tuple[str | None, list[str]]:
+    """Probe Gemini models once at startup and return the first one that
+    actually responds, plus the full ordered candidate list for mid-run
+    rotation. Free-tier 503s are model-specific, so the model named in
+    GEMINI_MODEL_PREFERENCES may be unavailable while another works."""
+    visible: set[str] = set()
+    try:
+        for model in client.models.list():
+            visible.add((model.name or "").removeprefix("models/"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Gemini model listing failed ({exc})", file=sys.stderr)
+
+    candidates = [m for m in GEMINI_MODEL_PREFERENCES if not visible or m in visible] or list(
+        GEMINI_MODEL_PREFERENCES
+    )
+    if GEMINI_MODEL_ENV:
+        candidates = [GEMINI_MODEL_ENV] + [c for c in candidates if c != GEMINI_MODEL_ENV]
+
+    for candidate in candidates:
+        try:
+            score_and_draft_gemini(client, candidate, probe_job, attempts=1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    Gemini {candidate}: {str(exc)[:90]}", file=sys.stderr)
+            continue
+        return candidate, [candidate] + [c for c in candidates if c != candidate]
+    return None, candidates
+
+
+def score_and_draft_gemini_multi(client: "_genai.Client", models: list[str], job: dict) -> dict:
+    """Try each candidate model until one answers."""
+    last: Exception | None = None
+    for index, model in enumerate(models):
+        try:
+            return score_and_draft_gemini(client, model, job, attempts=1 if index else 2)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if index < len(models) - 1:
+                print(f"    {model} unavailable; trying next model", file=sys.stderr)
     assert last is not None
     raise last
 
@@ -1221,16 +1250,7 @@ def error_row(job: dict, exc: Exception) -> dict:
 def self_test(resend_key: str) -> int:
     """Verify the DeepSeek and Resend wiring without touching the job feeds."""
     failures = 0
-    probe = {
-        "id": "self-test:1",
-        "title": "Backend Engineer (FastAPI / LLM)",
-        "company": "Self-test Co",
-        "description": "Build FastAPI services and LLM agent workflows in Python.",
-        "source": "self-test",
-        "tags": ["python", "fastapi", "llm"],
-        "location": "Remote (worldwide)",
-        "salary": "",
-    }
+    probe = PROBE_JOB
     print("== Self-test ==")
     print(f"  DEEPSEEK_API_KEY: {'set' if DEEPSEEK_API_KEY else 'MISSING'}")
     print(f"  RESEND_API_KEY:   {'set' if resend_key else 'MISSING'}")
@@ -1272,9 +1292,16 @@ def self_test(resend_key: str) -> int:
     if gemini_key and _genai is not None:
         try:
             client = _genai.Client(api_key=gemini_key)
-            model = pick_gemini_model(client)
-            result = score_and_draft_gemini(client, model, probe)
-            print(f"  Gemini fallback OK — model={model}, score={result.get('score')}")
+            model, models = select_working_gemini_model(client, probe)
+            if model:
+                result = score_and_draft_gemini(client, model, probe)
+                print(f"  Gemini fallback OK — model={model}, score={result.get('score')}")
+            else:
+                print(
+                    f"  No Gemini model responded out of {len(models)} candidates "
+                    "(non-fatal; DeepSeek is the primary engine).",
+                    file=sys.stderr,
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"  Gemini fallback failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -1321,9 +1348,10 @@ def main() -> int:
     use_deepseek = bool(DEEPSEEK_API_KEY)
     gemini_client = None
     gemini_model = None
+    gemini_models: list[str] = []
 
     def init_gemini() -> bool:
-        nonlocal gemini_client, gemini_model
+        nonlocal gemini_client, gemini_model, gemini_models
         gemini_key = os.environ.get("GEMINI_API_KEY")
         if not gemini_key:
             print("  GEMINI_API_KEY is not set", file=sys.stderr)
@@ -1335,7 +1363,10 @@ def main() -> int:
             )
             return False
         gemini_client = _genai.Client(api_key=gemini_key)
-        gemini_model = pick_gemini_model(gemini_client)
+        gemini_model, gemini_models = select_working_gemini_model(gemini_client, PROBE_JOB)
+        if not gemini_model:
+            print("  No Gemini model responded to a probe request", file=sys.stderr)
+            return False
         print(f"Engine: Gemini fallback ({gemini_model})")
         return True
 
@@ -1402,7 +1433,7 @@ def main() -> int:
             if use_deepseek:
                 result = score_and_draft_deepseek(job)
             else:
-                result = score_and_draft_gemini(gemini_client, gemini_model, job)
+                result = score_and_draft_gemini_multi(gemini_client, gemini_models, job)
         except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
             print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
             log_rows.append(error_row(job, exc))
