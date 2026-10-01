@@ -49,8 +49,11 @@ jobs:
           # Primary engine. This was missing from the workflow, so DeepSeek
           # was never actually used despite being the documented default.
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Cheap, fast model scores every posting.
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
-          # Fallback engine, only used when DEEPSEEK_API_KEY is absent.
+          # Stronger model rewrites the outreach for scoring matches only.
+          DEEPSEEK_DRAFT_MODEL: ${{ vars.DEEPSEEK_DRAFT_MODEL || 'deepseek-v4-pro' }}
+          # Fallback engine, only used when DeepSeek cannot spend.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Delivery.
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -59,6 +62,7 @@ jobs:
           # Optional.
           COGEXT_API_KEY: ${{ secrets.COGEXT_API_KEY }}
           AUTO_APPLY: ${{ vars.AUTO_APPLY || 'false' }}
+          AUTO_APPLY_MIN_SCORE: ${{ vars.AUTO_APPLY_MIN_SCORE || '8' }}
           MAX_JOBS_PER_RUN: ${{ vars.MAX_JOBS_PER_RUN || '40' }}
         run: |
           set -euo pipefail

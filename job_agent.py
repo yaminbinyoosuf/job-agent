@@ -187,6 +187,13 @@ MAX_JOBS_PER_RUN = int(os.environ.get("MAX_JOBS_PER_RUN") or 40)
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") or ""
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
+# Stronger model used ONLY to rewrite the outreach for scoring matches, so the
+# bulk scoring pass stays cheap and fast. Set to "" to disable the second pass.
+DEEPSEEK_DRAFT_MODEL = (
+    os.environ.get("DEEPSEEK_DRAFT_MODEL")
+    if os.environ.get("DEEPSEEK_DRAFT_MODEL") is not None
+    else "deepseek-v4-pro"
+)
 DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS") or 8000)
 
 GEMINI_MODEL_ENV = os.environ.get("GEMINI_MODEL") or ""
@@ -205,6 +212,8 @@ RESEND_API_URL = "https://api.resend.com/emails"
 RESEND_FROM = os.environ.get("RESEND_FROM") or "onboarding@resend.dev"
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or "yaminbinyoosuf@gmail.com"
 AUTO_APPLY = (os.environ.get("AUTO_APPLY") or "").strip().lower() in {"1", "true", "yes", "on"}
+# Only genuinely strong matches get a direct email to the company.
+AUTO_APPLY_MIN_SCORE = int(os.environ.get("AUTO_APPLY_MIN_SCORE") or 8)
 DRY_RUN = (os.environ.get("DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 COGEXT_API_KEY = os.environ.get("COGEXT_API_KEY") or ""
@@ -929,8 +938,8 @@ def check_deepseek_balance() -> tuple[bool, str]:
     return True, detail or "available"
 
 
-def score_and_draft_deepseek(job: dict) -> dict:
-    """Score a job and draft outreach with DeepSeek (JSON output mode)."""
+def _deepseek_json(prompt: str, model: str) -> dict:
+    """One DeepSeek JSON-mode call, returning the parsed object."""
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY is not set")
     resp = _post(
@@ -940,7 +949,7 @@ def score_and_draft_deepseek(job: dict) -> dict:
             "Content-Type": "application/json",
         },
         payload={
-            "model": DEEPSEEK_MODEL,
+            "model": model,
             "messages": [
                 {
                     "role": "system",
@@ -949,7 +958,7 @@ def score_and_draft_deepseek(job: dict) -> dict:
                         "single valid JSON object and nothing else."
                     ),
                 },
-                {"role": "user", "content": _build_score_prompt(job)},
+                {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
             "max_tokens": DEEPSEEK_MAX_TOKENS,
@@ -969,16 +978,59 @@ def score_and_draft_deepseek(job: dict) -> dict:
         reasoning = message.get("reasoning_content") or ""
         raise RuntimeError(
             f"DeepSeek returned empty content (finish_reason={choice.get('finish_reason')}, "
-            f"reasoning_chars={len(reasoning)}, model={DEEPSEEK_MODEL}). "
+            f"reasoning_chars={len(reasoning)}, model={model}). "
             f"Raise DEEPSEEK_MAX_TOKENS (currently {DEEPSEEK_MAX_TOKENS}) or use a "
             "non-reasoning model such as deepseek-chat."
         )
-    result = _parse_json_response(raw)
+    return _parse_json_response(raw)
+
+
+def score_and_draft_deepseek(job: dict) -> dict:
+    """Score a posting and draft a first outreach with the bulk model."""
+    result = _deepseek_json(_build_score_prompt(job), DEEPSEEK_MODEL)
     try:
         result["score"] = max(1, min(10, int(result.get("score", 0))))
     except (TypeError, ValueError):
         result["score"] = 0
     return result
+
+
+def _build_draft_prompt(job: dict, score: int, reason: str) -> str:
+    """Focused prompt for the strong model: write the email only.
+
+    Re-asking for the score would waste reasoning tokens on work the bulk
+    model already did, so this is deliberately narrow."""
+    return f"""Write the final outreach email for a specific candidate.
+
+CANDIDATE PROFILE:
+{PROFILE}
+
+OUTREACH EMAIL TEMPLATE (follow its tone and structure):
+{EMAIL_TEMPLATE}
+
+JOB POSTING:
+Title: {job.get('title', '')}
+Company: {job.get('company', '')}
+Location: {job.get('location', '')}
+Description:
+{(job.get('description') or '')[:4000]}
+
+An initial screen rated this posting {score}/10 with the note: {reason}
+
+Write the single best outreach email for this candidate. Replace the [name/team]
+and [role] placeholders, and tie ONE or TWO of the candidate's shipped projects
+(THRYVIX AI clinic OS, COGEXT commitment infrastructure) to what this posting
+actually needs. Under 150 words, plain text, no markdown. Never invent
+experience the profile does not support. Sign off as Yamin Binyoosuf.
+
+Respond with ONLY a JSON object:
+{{"email_subject": "<subject line under 80 characters>",
+  "email_body": "<the email, plain text, with real newlines>"}}"""
+
+
+def draft_email_deepseek(job: dict, score: int, reason: str) -> dict:
+    """Draft the outreach with the stronger drafting model."""
+    return _deepseek_json(_build_draft_prompt(job, score, reason), DEEPSEEK_DRAFT_MODEL)
 
 
 def score_and_draft_gemini(
@@ -1273,9 +1325,11 @@ def self_test(resend_key: str) -> int:
     print(f"  RESEND_API_KEY:   {'set' if resend_key else 'MISSING'}")
     print(f"  GEMINI_API_KEY:   {'set' if os.environ.get('GEMINI_API_KEY') else 'not set'}")
     print(f"  DEEPSEEK_MODEL:   {DEEPSEEK_MODEL}")
+    print(f"  DRAFT_MODEL:      {DEEPSEEK_DRAFT_MODEL or '(disabled — bulk draft only)'}")
     print(f"  RESEND_FROM:      {RESEND_FROM}")
     print(f"  NOTIFY_EMAIL:     {NOTIFY_EMAIL}")
-    print(f"  AUTO_APPLY:       {AUTO_APPLY}   DRY_RUN: {DRY_RUN}")
+    print(f"  AUTO_APPLY:       {AUTO_APPLY} (min score {AUTO_APPLY_MIN_SCORE})")
+    print(f"  DRY_RUN:          {DRY_RUN}")
 
     if DEEPSEEK_API_KEY:
         usable, status = check_deepseek_balance()
@@ -1336,6 +1390,25 @@ def self_test(resend_key: str) -> int:
     else:
         failures += 1
         print("  Resend not configured; skipping send.", file=sys.stderr)
+
+    # Can this account email anyone other than its owner? Resend blocks that
+    # until a domain is verified. delivered@resend.dev is Resend's own test
+    # sink, so this probe never sends real mail to a third party.
+    if resend_key and not DRY_RUN:
+        if send_email_via_resend(
+            resend_key,
+            "job-agent self-test: third-party delivery probe",
+            "Capability probe for AUTO_APPLY. No action needed.\n",
+            to="delivered@resend.dev",
+        ):
+            print("  Third-party sending: ENABLED — AUTO_APPLY can reach company contacts.")
+        else:
+            print(
+                "  Third-party sending: BLOCKED — Resend only delivers to your own "
+                "address until a domain is verified. Verify one at resend.com/domains "
+                "and set the RESEND_FROM secret; until then AUTO_APPLY cannot send.",
+                file=sys.stderr,
+            )
 
     print(f"== Self-test complete: {'FAILURES: ' + str(failures) if failures else 'all good'} ==")
     return 1 if failures else 0
@@ -1404,6 +1477,17 @@ def main() -> int:
         )
         return 1
 
+    if AUTO_APPLY:
+        print(f"AUTO_APPLY is ON — direct outreach for scores >= {AUTO_APPLY_MIN_SCORE}")
+        if RESEND_FROM.endswith("@resend.dev"):
+            print(
+                "  WARNING: RESEND_FROM is still the shared resend.dev test sender. "
+                "Resend only delivers that to your own address, so direct outreach to "
+                "companies will be rejected. Verify a domain at resend.com/domains and "
+                "set the RESEND_FROM secret to an address on it.",
+                file=sys.stderr,
+            )
+
     migrate_log_if_needed()
 
     print("Fetching listings...")
@@ -1462,6 +1546,28 @@ def main() -> int:
 
         emailed = False
         if score >= SCORE_THRESHOLD:
+            # Second pass: let the stronger model rewrite the outreach. Only
+            # runs for matches, so the expensive model is used sparingly.
+            if (
+                use_deepseek
+                and DEEPSEEK_DRAFT_MODEL
+                and DEEPSEEK_DRAFT_MODEL != DEEPSEEK_MODEL
+            ):
+                try:
+                    better = draft_email_deepseek(job, score, reason)
+                    if (better.get("email_body") or "").strip():
+                        result["email_body"] = better["email_body"]
+                        if better.get("email_subject"):
+                            result["email_subject"] = better["email_subject"]
+                        print(f"    outreach rewritten by {DEEPSEEK_DRAFT_MODEL}")
+                except Exception as exc:  # noqa: BLE001 - keep the first draft
+                    print(
+                        f"    {DEEPSEEK_DRAFT_MODEL} drafting failed "
+                        f"({type(exc).__name__}: {str(exc)[:90]}); keeping the "
+                        f"{DEEPSEEK_MODEL} draft",
+                        file=sys.stderr,
+                    )
+
             track_commitment(job, score)
             subject, body = build_match_email(job, result)
             emailed = send_email_via_resend(resend_key, subject, body)
@@ -1469,15 +1575,20 @@ def main() -> int:
                 emailed_count += 1
 
             # Optionally apply directly, but only to an address the posting
-            # itself published for applications.
+            # itself published, and only for genuinely strong matches.
             contact = job.get("contact_email")
-            if AUTO_APPLY and contact and emailed:
+            if AUTO_APPLY and contact and emailed and score >= AUTO_APPLY_MIN_SCORE:
                 direct_subject = result.get("email_subject") or subject
-                direct_body = result.get("email_body", "").strip()
+                direct_body = (result.get("email_body") or "").strip()
                 if direct_body:
                     if send_email_via_resend(resend_key, direct_subject, direct_body, to=contact):
                         auto_applied += 1
                         print(f"    direct outreach sent to {contact}")
+            elif AUTO_APPLY and contact and emailed:
+                print(
+                    f"    skipped direct send to {contact}: score {score} is below "
+                    f"AUTO_APPLY_MIN_SCORE={AUTO_APPLY_MIN_SCORE}"
+                )
 
         log_rows.append(
             {
