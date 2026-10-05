@@ -125,6 +125,32 @@ CREATE INDEX IF NOT EXISTS idx_leads_state ON leads(state);
 CREATE INDEX IF NOT EXISTS idx_leads_score ON leads(opportunity_score DESC);
 CREATE INDEX IF NOT EXISTS idx_leads_discovered ON leads(discovered_at DESC);
 
+CREATE TABLE IF NOT EXISTS llm_cache (
+    job_id       TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    analysis     TEXT NOT NULL,
+    llm_score    INTEGER,
+    llm_status   TEXT,
+    checked_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_stats (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    at                 TEXT NOT NULL,
+    raw                INTEGER DEFAULT 0,
+    unique_count       INTEGER DEFAULT 0,
+    rejected           INTEGER DEFAULT 0,
+    screened           INTEGER DEFAULT 0,
+    leads              INTEGER DEFAULT 0,
+    deepseek_calls     INTEGER DEFAULT 0,
+    deepseek_successes INTEGER DEFAULT 0,
+    deepseek_failures  INTEGER DEFAULT 0,
+    deepseek_skipped   INTEGER DEFAULT 0,
+    deepseek_cached    INTEGER DEFAULT 0,
+    proposal_calls     INTEGER DEFAULT 0,
+    kind               TEXT DEFAULT 'run'
+);
+
 CREATE TABLE IF NOT EXISTS lead_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     lead_id    TEXT NOT NULL,
@@ -259,13 +285,31 @@ class RevenueSummary:
 class LeadStore:
     """Thin, explicit wrapper around a SQLite database of leads."""
 
+    # Columns added after the first release; applied to existing databases.
+    _ADDED_COLUMNS = {
+        "llm_score": "INTEGER",
+        "llm_status": "TEXT",
+        "llm_recommendation": "TEXT",
+    }
+
     def __init__(self, path: str | Path = "leads.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add later columns to a database created by an earlier version."""
+        existing = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(leads)")
+        }
+        for column, kind in self._ADDED_COLUMNS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE leads ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self.conn.close()
@@ -297,8 +341,9 @@ class LeadStore:
                     estimated_hours, implied_hourly_usd, budget_text, budget_usd,
                     competition, location, posted_at, discovered_at, updated_at,
                     state, state_changed_at, reason, why, red_flags,
-                    matched_skills, source_payload
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    matched_skills, source_payload,
+                    llm_score, llm_status, llm_recommendation
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     lead_id,
@@ -327,6 +372,9 @@ class LeadStore:
                     json.dumps(record.get("red_flags", [])),
                     json.dumps(record.get("matched_skills", [])),
                     json.dumps(record.get("source_payload", {})),
+                    record.get("llm_score"),
+                    record.get("llm_status", ""),
+                    record.get("llm_recommendation", ""),
                 ),
             )
             self._event(lead_id, None, state, "discovered")
@@ -479,6 +527,126 @@ class LeadStore:
         for row in rows:
             self.set_state(row["lead_id"], "EXPIRED", f"older than {max_age_days} days")
         return len(rows)
+
+    # -- DeepSeek analysis cache -------------------------------------------
+
+    def get_llm_analysis(self, job_id: str, content_hash: str) -> dict | None:
+        """Return a cached analysis, or None when it is missing or stale.
+
+        A stale entry (the listing materially changed) is treated as a miss so
+        it gets re-analysed exactly once."""
+        row = self.conn.execute(
+            "SELECT content_hash, analysis, llm_status FROM llm_cache WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None or row["content_hash"] != content_hash:
+            return None
+        try:
+            analysis = json.loads(row["analysis"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(analysis, dict) or not analysis:
+            return None
+        analysis["_cached"] = True
+        analysis["_status"] = row["llm_status"]
+        return analysis
+
+    def save_llm_analysis(
+        self,
+        job_id: str,
+        content_hash: str,
+        analysis: dict,
+        status: str = "ok",
+    ) -> None:
+        """Persist one analysis so the same listing is never analysed twice."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO llm_cache "
+            "(job_id, content_hash, analysis, llm_score, llm_status, checked_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                job_id,
+                content_hash,
+                json.dumps(analysis),
+                analysis.get("llm_score"),
+                status,
+                _now(),
+            ),
+        )
+        self.conn.commit()
+
+    def llm_cache_size(self) -> int:
+        return int(
+            self.conn.execute("SELECT COUNT(*) c FROM llm_cache").fetchone()["c"]
+        )
+
+    # -- per-run usage ------------------------------------------------------
+
+    def record_run_stats(self, stats: dict[str, Any], kind: str = "run") -> None:
+        """Append one run's funnel and DeepSeek-usage counters.
+
+        This is what makes "is DeepSeek usage staying low?" answerable."""
+        self.conn.execute(
+            """
+            INSERT INTO run_stats (
+                at, raw, unique_count, rejected, screened, leads,
+                deepseek_calls, deepseek_successes, deepseek_failures,
+                deepseek_skipped, deepseek_cached, proposal_calls, kind
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                _now(),
+                int(stats.get("raw", 0) or 0),
+                int(stats.get("unique", 0) or 0),
+                int(stats.get("rejected", 0) or 0),
+                int(stats.get("screened", 0) or 0),
+                int(stats.get("leads", 0) or 0),
+                int(stats.get("deepseek_calls", 0) or 0),
+                int(stats.get("deepseek_successes", 0) or 0),
+                int(stats.get("deepseek_failures", 0) or 0),
+                int(stats.get("deepseek_skipped", 0) or 0),
+                int(stats.get("deepseek_cached", 0) or 0),
+                int(stats.get("proposal_calls", 0) or 0),
+                kind,
+            ),
+        )
+        self.conn.commit()
+
+    def recent_run_stats(self, limit: int = 10, kind: str | None = None) -> list[sqlite3.Row]:
+        if kind is None:
+            return list(
+                self.conn.execute(
+                    "SELECT * FROM run_stats ORDER BY id DESC LIMIT ?", (limit,)
+                )
+            )
+        return list(
+            self.conn.execute(
+                "SELECT * FROM run_stats WHERE kind = ? ORDER BY id DESC LIMIT ?",
+                (kind, limit),
+            )
+        )
+
+    def llm_usage_summary(self, runs: int = 30) -> dict[str, Any]:
+        """DeepSeek usage for the most recent run and across recent runs."""
+        rows = self.recent_run_stats(limit=runs)
+        run_rows = self.recent_run_stats(limit=runs, kind="run")
+        totals = {
+            key: sum(int(row[key] or 0) for row in rows)
+            for key in (
+                "deepseek_calls",
+                "deepseek_successes",
+                "deepseek_failures",
+                "deepseek_skipped",
+                "deepseek_cached",
+                "proposal_calls",
+            )
+        }
+        last = dict(run_rows[0]) if run_rows else {}
+        return {
+            "runs": len(rows),
+            "cache_entries": self.llm_cache_size(),
+            "last_run": last,
+            "totals": totals,
+        }
 
     # -- revenue -----------------------------------------------------------
 

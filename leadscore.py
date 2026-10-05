@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import llmscreen
+
 # ---------------------------------------------------------------------------
 # Weights
 # ---------------------------------------------------------------------------
@@ -566,7 +568,13 @@ def classify_interview(job: dict, llm_result: dict | None = None) -> str:
     if explicit_none and not heavy:
         return "NONE"
 
-    model = str((llm_result or {}).get("interview_process") or "").strip().lower()
+    # The strict screen schema calls this interview_likelihood; the older
+    # Gemini fallback path calls it interview_process. Honour both.
+    model = str(
+        (llm_result or {}).get("interview_likelihood")
+        or (llm_result or {}).get("interview_process")
+        or ""
+    ).strip().lower()
     if model in ("none",):
         return "NONE"
     if model in ("light",):
@@ -975,15 +983,10 @@ def evaluate(
 
     # The LLM screen can veto or endorse, but only within a bounded band: the
     # deterministic signals stay in charge of the ranking.
-    model_score = None
-    if llm_result:
-        try:
-            model_score = int(llm_result.get("score"))
-        except (TypeError, ValueError):
-            model_score = None
-    if model_score is not None:
-        # model score is 1-10 -> map to a -8..+8 adjustment
-        total += (model_score - 6) * 8 / 5
+    # DeepSeek is a bounded final-judgment layer, never the primary score.
+    # llmscreen.score_adjustment() cannot move the total by more than +/-8 and
+    # contributes nothing at all for a missing or unvalidated analysis.
+    total += llmscreen.score_adjustment(llm_result)
 
     if budget and budget.is_known:
         hourly = (

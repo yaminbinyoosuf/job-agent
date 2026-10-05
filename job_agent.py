@@ -35,9 +35,22 @@ Optional environment variables:
     MAX_JOBS_PER_RUN    Cap on postings scored per run (default 40)
 
 Usage:
-    python job_agent.py                # normal run
-    python job_agent.py --self-test    # verify DeepSeek + Resend wiring
-    python job_agent.py --dry-run      # score + log, send nothing
+    python job_agent.py                     # normal run
+    python job_agent.py --self-test         # verify DeepSeek + Resend wiring
+    python job_agent.py --dry-run           # score + log, send nothing
+    python job_agent.py --no-llm            # deterministic only, zero API calls
+    python job_agent.py --metrics           # funnel, revenue, DeepSeek usage
+    python job_agent.py --list              # open leads
+    python job_agent.py --dashboard         # re-render dashboard.html
+    python job_agent.py --propose <lead_id> # draft a proposal on demand
+    python job_agent.py --mark <id> <STATE> # advance the lead lifecycle
+    python job_agent.py --revenue <id> <amt> [ccy] [pending|collected]
+
+DeepSeek is a bounded final-judgment layer, never the scraper, filter or
+scoring engine. It is called only for candidates that survive every
+deterministic filter, never more than DEEPSEEK_MAX_SCREENED_CALLS per run,
+results are cached against the listing content, and any failure falls back to
+the deterministic score.
 """
 
 from __future__ import annotations
@@ -65,6 +78,7 @@ import requests
 # into a handful of winnable, paid engineering tasks.
 import dashboard as dashboard_mod
 import leadscore
+import llmscreen
 import leadstore
 import pipeline
 import proposals
@@ -331,6 +345,18 @@ DEEPSEEK_DRAFT_MODEL = (
     else "deepseek-v4-pro"
 )
 DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS") or 8000)
+
+# Hard per-run DeepSeek caps. DeepSeek is a final judgment layer, not a
+# scraper: only candidates that survive every deterministic filter are ever
+# sent, and never more than this many. MAX_JOBS_PER_RUN is honoured as a
+# legacy alias so an existing configuration keeps working.
+DEEPSEEK_MAX_SCREENED_CALLS = int(
+    os.environ.get("DEEPSEEK_MAX_SCREENED_CALLS")
+    or os.environ.get("MAX_JOBS_PER_RUN")
+    or 15
+)
+# Proposals are generated on demand only, never for every lead.
+DEEPSEEK_MAX_PROPOSAL_CALLS = int(os.environ.get("DEEPSEEK_MAX_PROPOSAL_CALLS") or 5)
 # Reasoning models are the dominant cost per run (a draft costs roughly 10x a
 # scoring call), so cap how many are spent per run. Beyond the cap the bulk
 # model's draft is used, which is still perfectly serviceable.
@@ -1549,14 +1575,19 @@ def _deepseek_json(prompt: str, model: str) -> dict:
     return _parse_json_response(raw)
 
 
-def score_and_draft_deepseek(job: dict) -> dict:
-    """Score a posting and draft a first outreach with the bulk model."""
-    result = _deepseek_json(_build_score_prompt(job), DEEPSEEK_MODEL)
-    try:
-        result["score"] = max(1, min(10, int(result.get("score", 0))))
-    except (TypeError, ValueError):
-        result["score"] = 0
-    return result
+def screen_candidate_deepseek(job: dict) -> dict:
+    """One schema-validated DeepSeek judgement for an already-screened candidate.
+
+    This is the only place a screening request is made. It is deliberately
+    narrow: the model answers the qualitative questions deterministic rules
+    cannot, and returns strict JSON that is validated here.
+
+    Raises on a transport error or an invalid schema, which the pipeline counts
+    as a failed call and covers by falling back to the deterministic score."""
+    evaluation = leadscore.evaluate(job, None)
+    prompt = llmscreen.build_screen_prompt(job, evaluation)
+    payload = _deepseek_json(prompt, DEEPSEEK_MODEL)
+    return llmscreen.parse_screen_result(payload)
 
 
 def _build_draft_prompt(job: dict, score: int, reason: str) -> str:
@@ -1928,8 +1959,9 @@ def self_test(resend_key: str) -> int:
     print(f"  RESEND_API_KEY:   {'set' if resend_key else 'MISSING'}")
     print(f"  GEMINI_API_KEY:   {'set' if os.environ.get('GEMINI_API_KEY') else 'not set'}")
     print(f"  DEEPSEEK_MODEL:   {DEEPSEEK_MODEL}")
-    print(f"  DRAFT_MODEL:      {DEEPSEEK_DRAFT_MODEL or '(disabled — bulk draft only)'}")
-    print(f"  Strong drafts/run:{MAX_STRONG_DRAFTS}")
+    print(f"  DRAFT_MODEL:      {DEEPSEEK_DRAFT_MODEL or '(disabled)'}")
+    print(f"  Screen cap/run:   {DEEPSEEK_MAX_SCREENED_CALLS} DeepSeek calls")
+    print(f"  Proposal cap/run: {DEEPSEEK_MAX_PROPOSAL_CALLS} DeepSeek calls (on demand only)")
     print(f"  RESEND_FROM:      {RESEND_FROM}")
     print(f"  NOTIFY_EMAIL:     {NOTIFY_EMAIL}")
     print(f"  AUTO_APPLY:       {AUTO_APPLY} (min score {AUTO_APPLY_MIN_SCORE})")
@@ -1948,14 +1980,21 @@ def self_test(resend_key: str) -> int:
         print(f"  DeepSeek balance: {status}")
         try:
             started = time.monotonic()
-            result = score_and_draft_deepseek(probe)
+            result = screen_candidate_deepseek(probe)
             elapsed = time.monotonic() - started
-            print(f"  DeepSeek call OK in {elapsed:.1f}s — score={result.get('score')}")
-            print(f"    reason:  {str(result.get('reason'))[:160]}")
-            print(f"    subject: {str(result.get('email_subject'))[:120]}")
-            if not result.get("email_body"):
-                failures += 1
-                print("    but the draft body was empty", file=sys.stderr)
+            print(f"  DeepSeek screen OK in {elapsed:.1f}s (1 call of "
+                  f"{DEEPSEEK_MAX_SCREENED_CALLS}/run)")
+            print(f"    llm_score:   {result.get('llm_score')}/10")
+            print(f"    recommend:   {result.get('recommendation')}")
+            print(f"    task_type:   {result.get('task_type')}")
+            print(f"    effort:      {result.get('estimated_effort')}")
+            print(f"    interview:   {result.get('interview_likelihood')}")
+            print(f"    budget:      {result.get('budget_quality')}")
+            print(f"    risk:        {result.get('risk')}")
+            print(f"    reason:      {str(result.get('reason'))[:140]}")
+        except llmscreen.InvalidScreenResult as exc:
+            failures += 1
+            print(f"  DeepSeek returned an invalid schema: {exc}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             if not usable:
                 print(
@@ -2138,9 +2177,48 @@ def _print_revenue(revenue: "leadstore.RevenueSummary") -> None:
 # ---------------------------------------------------------------------------
 
 
+def usage_line(usage, cap: int) -> str:
+    """One-line DeepSeek usage report for the run summary."""
+    return (
+        f"DeepSeek: {usage.candidates} candidate(s) eligible, "
+        f"{usage.calls}/{cap} calls made, {usage.successes} ok, "
+        f"{usage.failures} failed, {usage.cached} cached, "
+        f"{usage.skipped} skipped"
+    )
+
+
+def _print_usage(usage: dict) -> None:
+    """Show exactly how much DeepSeek the agent has been spending."""
+    last = usage.get("last_run") or {}
+    totals = usage.get("totals") or {}
+    print(f"  cache entries:        {usage.get('cache_entries', 0)}")
+    print(f"  runs recorded:        {usage.get('runs', 0)}")
+    if last:
+        print("  last run:")
+        print(f"    candidates eligible: {last.get('deepseek_candidates', 0)}")
+        print(f"    calls made:          {last.get('deepseek_calls', 0)}")
+        print(f"    successes:           {last.get('deepseek_successes', 0)}")
+        print(f"    failures:            {last.get('deepseek_failures', 0)}")
+        print(f"    cache hits:          {last.get('deepseek_cached', 0)}")
+        print(f"    skipped (over cap):  {last.get('deepseek_skipped', 0)}")
+    print(f"  per-run cap:          DEEPSEEK_MAX_SCREENED_CALLS={DEEPSEEK_MAX_SCREENED_CALLS}")
+    print(f"  proposal cap:         DEEPSEEK_MAX_PROPOSAL_CALLS={DEEPSEEK_MAX_PROPOSAL_CALLS}")
+    if totals:
+        print(f"  totals over {usage.get('runs', 0)} runs:")
+        print(f"    calls: {totals.get('deepseek_calls', 0)}  "
+              f"ok: {totals.get('deepseek_successes', 0)}  "
+              f"failed: {totals.get('deepseek_failures', 0)}  "
+              f"cached: {totals.get('deepseek_cached', 0)}  "
+              f"skipped: {totals.get('deepseek_skipped', 0)}")
+        print(f"    proposal calls: {totals.get('proposal_calls', 0)}")
+
+
 def cmd_metrics() -> int:
     with open_store() as store:
         store.mark_stale_as_expired(MAX_LEAD_AGE_DAYS)
+        print("DEEPSEEK USAGE")
+        _print_usage(store.llm_usage_summary())
+        print()
         print("FUNNEL (last 30 days)")
         _print_funnel(store.funnel_metrics(days=30))
         print("\nREVENUE / DEBT")
@@ -2191,6 +2269,13 @@ def cmd_mark(lead_id: str, state: str, note: str = "") -> int:
             print(f"No such lead: {lead_id}", file=sys.stderr)
             return 1
         print(f"{lead_id} -> {state.upper()}")
+        # Explicitly marking a lead READY_TO_APPLY is one of the three
+        # permitted triggers for proposal generation.
+        if state.upper() == "READY_TO_APPLY":
+            text, origin = generate_proposal_for_lead(store, lead_id)
+            print(f"  proposal written via {origin} ({len(text)} chars)")
+            if origin == "model":
+                store.record_run_stats({"proposal_calls": 1}, kind="proposal")
     return 0
 
 
@@ -2202,6 +2287,81 @@ def cmd_revenue(lead_id: str, amount: float, currency: str, status: str) -> int:
         store.record_revenue(lead_id, amount, currency, status)
         print(f"Recorded {currency} {amount:,.2f} ({status}) against {lead_id}")
         _print_revenue(store.revenue_summary(DEBT_TARGET_INR, DEBT_DEADLINE))
+    return 0
+
+
+def _lead_job_from_store(row) -> dict:
+    """Rebuild enough of a listing from the store to draft a proposal."""
+    try:
+        payload = json.loads(row["source_payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    job = dict(payload.get("job") or {})
+    job.setdefault("id", row["lead_id"])
+    job.setdefault("title", row["title"])
+    job.setdefault("company", row["company"])
+    job.setdefault("source", row["source"])
+    job.setdefault("url", row["url"])
+    job.setdefault("work_type", row["work_type"])
+    job.setdefault("salary", row["budget_text"] or "")
+    job.setdefault("description", "")
+    return job
+
+
+def _lead_llm_result(row) -> dict | None:
+    try:
+        payload = json.loads(row["source_payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    result = payload.get("llm")
+    return result if isinstance(result, dict) and result else None
+
+
+def generate_proposal_for_lead(store, lead_id: str) -> tuple[str, str]:
+    """Draft (and store) a proposal for one lead. Returns (text, origin)."""
+    row = store.get_lead(lead_id)
+    if row is None:
+        raise KeyError(lead_id)
+    job = _lead_job_from_store(row)
+    evaluation = leadscore.evaluate(job, None)
+    llm_proposal = None
+    if DEEPSEEK_API_KEY:
+        llm_proposal = lambda prompt: _deepseek_json(
+            prompt, DEEPSEEK_DRAFT_MODEL or DEEPSEEK_MODEL
+        )
+    text, origin = proposals.generate_proposal(
+        job, evaluation, _lead_llm_result(row), llm_call=llm_proposal
+    )
+    store.set_proposal(lead_id, text)
+    return text, origin
+
+
+def cmd_propose(lead_ids: list[str]) -> int:
+    """Generate proposals on demand. Never automatic, always capped."""
+    if not lead_ids:
+        print("usage: --propose <lead_id> [<lead_id> ...]", file=sys.stderr)
+        return 2
+    if len(lead_ids) > DEEPSEEK_MAX_PROPOSAL_CALLS:
+        print(
+            f"asked for {len(lead_ids)} proposals; "
+            f"DEEPSEEK_MAX_PROPOSAL_CALLS={DEEPSEEK_MAX_PROPOSAL_CALLS}, "
+            f"so only the first {DEEPSEEK_MAX_PROPOSAL_CALLS} will be generated.",
+            file=sys.stderr,
+        )
+        lead_ids = lead_ids[: DEEPSEEK_MAX_PROPOSAL_CALLS]
+
+    calls = 0
+    with open_store() as store:
+        for lead_id in lead_ids:
+            if store.get_lead(lead_id) is None:
+                print(f"  no such lead: {lead_id}", file=sys.stderr)
+                continue
+            text, origin = generate_proposal_for_lead(store, lead_id)
+            if origin == "model":
+                calls += 1
+            print(f"  {lead_id}: proposal written via {origin} ({len(text)} chars)")
+        if calls:
+            store.record_run_stats({"proposal_calls": calls}, kind="proposal")
     return 0
 
 
@@ -2270,6 +2430,9 @@ def main() -> int:
             print("usage: --mark <lead_id> <STATE> [note]", file=sys.stderr)
             return 2
         return cmd_mark(args[index + 1], args[index + 2], " ".join(args[index + 3:]))
+    if "--propose" in flags:
+        index = args.index("--propose")
+        return cmd_propose(args[index + 1:])
     if "--revenue" in flags:
         index = args.index("--revenue")
         if len(args) < index + 3:
@@ -2371,6 +2534,13 @@ def main() -> int:
 
     pace = {"last": 0.0}
 
+    def cache_get(job: dict, fingerprint: str) -> dict | None:
+        """Reuse a previous DeepSeek analysis instead of paying for it again."""
+        return store.get_llm_analysis(str(job.get("id")), fingerprint)
+
+    def cache_put(job: dict, fingerprint: str, analysis: dict) -> None:
+        store.save_llm_analysis(str(job.get("id")), fingerprint, analysis, "ok")
+
     def llm_call(job: dict) -> dict:
         """Screen one listing. Paces the Gemini free tier when in use."""
         if not use_deepseek:
@@ -2379,7 +2549,7 @@ def main() -> int:
                 time.sleep(wait)
             pace["last"] = time.monotonic()
             return score_and_draft_gemini_multi(gemini_client, gemini_models, job)
-        return score_and_draft_deepseek(job)
+        return screen_candidate_deepseek(job)
 
     def prefilter(job: dict) -> str | None:
         """Reuse the existing title blocklist and keyword evidence rules.
@@ -2401,9 +2571,11 @@ def main() -> int:
         min_hourly_value=MIN_HOURLY_VALUE,
         require_budget=REQUIRE_BUDGET,
         llm_call=None if no_llm else llm_call,
-        llm_budget=MAX_JOBS_PER_RUN,
+        llm_budget=DEEPSEEK_MAX_SCREENED_CALLS,
         known_ids=known,
         prefilter=prefilter,
+        cache_get=None if no_llm else cache_get,
+        cache_put=None if no_llm else cache_put,
         store=store,
     )
     stats = result.stats()
@@ -2412,21 +2584,15 @@ def main() -> int:
     if stats["rejection_summary"]:
         top = ", ".join(f"{k}={v}" for k, v in list(stats["rejection_summary"].items())[:6])
         print(f"    {top}")
-    print(f"  {stats['scored']} screened by the model ({stats['llm_calls']} calls)")
+    print(
+        f"  {usage_line(result.usage, DEEPSEEK_MAX_SCREENED_CALLS)}"
+    )
     print(f"  {len(result.leads)} lead(s) at or above {QUALITY_THRESHOLD}/100")
 
-    # --- proposal assistance for the leads that cleared the bar ------------
-    strong_used = 0
-    for lead in result.leads:
-        llm_proposal = None
-        if use_deepseek and strong_used < MAX_STRONG_DRAFTS:
-            strong_used += 1
-            llm_proposal = lambda prompt: _deepseek_json(prompt, DEEPSEEK_DRAFT_MODEL)
-        text, origin = proposals.generate_proposal(
-            lead.job, lead.evaluation, lead.llm_result, llm_call=llm_proposal
-        )
-        store.set_proposal(lead.lead_id, text)
-        log.info("proposal lead=%s origin=%s", lead.lead_id, origin)
+    # Proposals are NOT generated here. They cost a second DeepSeek call each
+    # and most leads are never applied to, so they are produced on demand with
+    # `--propose <lead_id>`, or automatically for a lead you explicitly mark
+    # READY_TO_APPLY. See cmd_propose().
 
     todays = store.top_leads(
         limit=MAX_LEADS_PER_DAY, min_score=QUALITY_THRESHOLD, since=today_start_iso()
@@ -2474,6 +2640,21 @@ def main() -> int:
         print("  (dry run: audit log not written)")
     else:
         append_log(_audit_rows(result))
+
+    # Persist the counters so `--metrics` can answer "is DeepSeek usage low?".
+    usage = result.usage
+    if not DRY_RUN:
+        store.record_run_stats(
+            {
+                "raw": stats["raw"],
+                "unique": stats["deduped"],
+                "rejected": stats["rejected"],
+                "screened": stats["scored"],
+                "leads": len(result.leads),
+                **usage.as_dict(),
+                "proposal_calls": 0,
+            }
+        )
     log.info(
         "run_complete raw=%d unique=%d rejected=%d scored=%d leads=%d emailed=%s",
         stats["raw"], stats["deduped"], stats["rejected"], stats["scored"],

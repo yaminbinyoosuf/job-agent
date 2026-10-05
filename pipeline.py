@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 import leadscore
+import llmscreen
 
 log = logging.getLogger("taskagent.pipeline")
 
@@ -45,6 +46,31 @@ class ScreenedLead:
 
 
 @dataclass
+class LLMUsage:
+    """How the DeepSeek budget was actually spent on one run.
+
+    ``calls`` is what matters for credit: it counts real API requests, never
+    cache hits and never candidates that were skipped."""
+
+    candidates: int = 0      # post-filter candidates available to screen
+    calls: int = 0           # real DeepSeek requests attempted
+    successes: int = 0
+    failures: int = 0
+    cached: int = 0          # reused from a previous run, zero cost
+    skipped: int = 0         # eligible but over the per-run cap
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "deepseek_candidates": self.candidates,
+            "deepseek_calls": self.calls,
+            "deepseek_successes": self.successes,
+            "deepseek_failures": self.failures,
+            "deepseek_cached": self.cached,
+            "deepseek_skipped": self.skipped,
+        }
+
+
+@dataclass
 class ScreeningResult:
     raw_count: int = 0
     deduped_count: int = 0
@@ -54,8 +80,13 @@ class ScreeningResult:
     # the audit log can record the full decision.
     scored_leads: list[ScreenedLead] = field(default_factory=list)
     scored_count: int = 0
-    llm_calls: int = 0
     below_threshold: int = 0
+    usage: LLMUsage = field(default_factory=LLMUsage)
+
+    @property
+    def llm_calls(self) -> int:
+        """Backwards-compatible alias for real DeepSeek requests."""
+        return self.usage.calls
 
     @property
     def rejection_summary(self) -> dict[str, int]:
@@ -74,6 +105,7 @@ class ScreeningResult:
             "below_threshold": self.below_threshold,
             "leads": len(self.leads),
             "llm_calls": self.llm_calls,
+            **self.usage.as_dict(),
             "rejection_summary": self.rejection_summary,
         }
 
@@ -95,8 +127,10 @@ def screen_jobs(
     min_hourly_value: float = 8.0,
     require_budget: bool = False,
     llm_call: Callable[[dict], dict] | None = None,
-    llm_budget: int = 40,
+    llm_budget: int = 15,
     known_ids: set[str] | None = None,
+    cache_get: Callable[[dict, str], dict | None] | None = None,
+    cache_put: Callable[[dict, str, dict], None] | None = None,
     prefilter: Callable[[dict], str | None] | None = None,
     dedupe_fn: Callable[[list[dict]], list[dict]] | None = None,
     store: Any = None,
@@ -162,20 +196,63 @@ def screen_jobs(
         result.rejection_summary,
     )
 
-    # 2. Spend the model only on the most promising candidates.
+    # 2. Spend DeepSeek only on the most promising candidates, and never more
+    #    than the per-run cap. Cache hits are free, so they are resolved first
+    #    and do not consume the budget.
     survivors.sort(key=lambda pair: pair[1].opportunity_score, reverse=True)
-    to_score = survivors[: max(0, llm_budget)]
-    untouched = survivors[len(to_score):]
+    usage = result.usage
+    usage.candidates = len(survivors)
+
+    plan: list[tuple[dict, Any, str, dict | None]] = []
+    uncached: list[tuple[dict, Any, str]] = []
+    for job, base_evaluation in survivors:
+        fingerprint = llmscreen.content_hash(job)
+        hit = None
+        if cache_get is not None:
+            try:
+                hit = cache_get(job, fingerprint)
+            except Exception as exc:  # noqa: BLE001 - cache must never break a run
+                log.warning("llm cache lookup failed for %s: %s", job.get("id"), exc)
+        if hit:
+            usage.cached += 1
+            plan.append((job, base_evaluation, fingerprint, hit))
+        else:
+            uncached.append((job, base_evaluation, fingerprint))
+
+    budget = max(0, llm_budget)
+    to_call = uncached[:budget]
+    usage.skipped = len(uncached) - len(to_call)
+    for job, base_evaluation, fingerprint in to_call:
+        if usage.calls >= budget:
+            # Hard stop. Never silently exceed the cap.
+            usage.skipped += 1
+            plan.append((job, base_evaluation, fingerprint, None))
+            continue
+        if llm_call is None:
+            plan.append((job, base_evaluation, fingerprint, None))
+            continue
+        usage.calls += 1
+        analysis = None
+        try:
+            analysis = llm_call(job)
+            usage.successes += 1
+        except Exception as exc:  # noqa: BLE001 - one bad call must not stop the run
+            usage.failures += 1
+            log.warning("deepseek screening failed for %s: %s", job.get("id"), exc)
+        if analysis and cache_put is not None:
+            try:
+                cache_put(job, fingerprint, analysis)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("llm cache write failed for %s: %s", job.get("id"), exc)
+        plan.append((job, base_evaluation, fingerprint, analysis))
+
+    for job, base_evaluation, fingerprint in uncached[len(to_call):]:
+        plan.append((job, base_evaluation, fingerprint, None))
+
+    plan.sort(key=lambda item: item[1].opportunity_score, reverse=True)
 
     scored: list[ScreenedLead] = []
-    for job, base_evaluation in to_score:
-        llm_result = None
-        if llm_call is not None:
-            try:
-                llm_result = llm_call(job)
-                result.llm_calls += 1
-            except Exception as exc:  # noqa: BLE001 - one bad call must not stop the run
-                log.warning("llm screening failed for %s: %s", job.get("id"), exc)
+    for job, _base, _fingerprint, llm_result in plan:
         evaluation = leadscore.evaluate(
             job,
             llm_result,
@@ -190,9 +267,9 @@ def screen_jobs(
 
     # 3. Quality bar. Deliberately not lowered to fill the list.
     qualified = [lead for lead in scored if lead.score >= min_score]
+    # Every survivor is evaluated, whether it got a DeepSeek call, a cache hit
+    # or was skipped over the cap, so this is a complete count.
     result.below_threshold = len(scored) - len(qualified)
-    for job, evaluation in untouched:
-        result.below_threshold += 1
 
     qualified.sort(key=lambda lead: lead.score, reverse=True)
     result.leads = qualified[:limit]
@@ -207,6 +284,11 @@ def screen_jobs(
         len(qualified),
         min_score,
         len(result.leads),
+    )
+    log.info(
+        "deepseek: candidates=%d calls=%d ok=%d failed=%d cached=%d skipped=%d cap=%d",
+        usage.candidates, usage.calls, usage.successes, usage.failures,
+        usage.cached, usage.skipped, budget,
     )
 
     if store is not None:
@@ -241,6 +323,34 @@ def persist(result: ScreeningResult, store: Any) -> None:
                 "reason": (lead.llm_result or {}).get("reason", ""),
                 "red_flags": evaluation.red_flags,
                 "matched_skills": evaluation.matched_skills,
+                # The DeepSeek verdict travels with the lead, so the analysis
+                # is stored and visible rather than only influencing a number.
+                "llm_score": (lead.llm_result or {}).get("llm_score"),
+                "llm_status": "ok" if lead.llm_result else "unavailable",
+                "llm_recommendation": (lead.llm_result or {}).get("recommendation"),
+                "source_payload": {
+                    "llm": {
+                        k: v
+                        for k, v in (lead.llm_result or {}).items()
+                        if not str(k).startswith("_")
+                    },
+                    # Snapshot enough of the listing to regenerate a proposal
+                    # later without re-fetching or re-scraping anything.
+                    "job": {
+                        "id": lead.job.get("id", ""),
+                        "source": lead.job.get("source", ""),
+                        "title": lead.job.get("title", ""),
+                        "company": lead.job.get("company", ""),
+                        "url": lead.job.get("url", ""),
+                        "work_type": lead.job.get("work_type", ""),
+                        "location": lead.job.get("location", ""),
+                        "salary": lead.job.get("salary", ""),
+                        "tags": lead.job.get("tags", []),
+                        "competition": lead.job.get("competition"),
+                        "no_interview": lead.job.get("no_interview"),
+                        "description": (lead.job.get("description") or "")[:4000],
+                    },
+                },
             }
         )
 
