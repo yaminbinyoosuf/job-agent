@@ -782,9 +782,13 @@ class LeadStore:
                 if (row.get("reason") or "").startswith("rejected:"):
                     continue
                 try:
-                    score = int(float(row.get("score") or 0)) * 10
+                    raw_score = float(row.get("score") or 0)
                 except ValueError:
-                    score = 0
+                    raw_score = 0.0
+                # jobs_log.csv has held two scales: the original pipeline wrote
+                # 1-10, the task pipeline writes 0-100. Detect rather than
+                # assume, otherwise every legacy row imports as 100.
+                score = int(raw_score) if raw_score > 10 else int(raw_score * 10)
                 now = _now()
                 self.conn.execute(
                     """

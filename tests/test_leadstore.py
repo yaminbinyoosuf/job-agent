@@ -291,6 +291,20 @@ class TestLegacyImport(StoreCase):
         self.assertIsNotNone(self.store.get_lead("a:emailed"))
         self.assertIsNone(self.store.get_lead("a:notsent"))
 
+    def test_import_handles_both_score_scales(self):
+        """Regression: the CSV has held 1-10 and 0-100 scores. Assuming 1-10
+        turned every legacy row into a 100."""
+        csv_path = Path(self._dir.name) / "jobs_log.csv"
+        csv_path.write_text(
+            "timestamp,job_id,source,title,company,url,score,emailed,reason,rubric\n"
+            '2026-08-22T19:59:00+00:00,a:old10,Arbeitnow,Old,X,https://x/1,8,True,"r",""\n'
+            '2026-10-05T19:59:00+00:00,a:new100,Jobicy,New,X,https://x/2,82,True,"r",""\n',
+            encoding="utf-8",
+        )
+        self.store.import_legacy_csv(csv_path)
+        self.assertEqual(self.store.get_lead("a:old10")["opportunity_score"], 80)
+        self.assertEqual(self.store.get_lead("a:new100")["opportunity_score"], 82)
+
     def test_rejected_rows_are_not_imported(self):
         """The audit CSV must never turn into a blacklist."""
         csv_path = Path(self._dir.name) / "jobs_log.csv"
