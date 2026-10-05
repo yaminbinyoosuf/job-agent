@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS run_stats (
     rejected           INTEGER DEFAULT 0,
     screened           INTEGER DEFAULT 0,
     leads              INTEGER DEFAULT 0,
+    deepseek_candidates INTEGER DEFAULT 0,
     deepseek_calls     INTEGER DEFAULT 0,
     deepseek_successes INTEGER DEFAULT 0,
     deepseek_failures  INTEGER DEFAULT 0,
@@ -301,15 +302,36 @@ class LeadStore:
         self._migrate()
         self.conn.commit()
 
+    # Columns added to run_stats after the first release.
+    # The complete expected shape. _add_missing_columns skips what already
+    # exists, so listing every column makes the migration total: any older or
+    # partial run_stats table is brought up to date rather than half-fixed.
+    _ADDED_RUN_STATS_COLUMNS = {
+        "raw": "INTEGER DEFAULT 0",
+        "unique_count": "INTEGER DEFAULT 0",
+        "rejected": "INTEGER DEFAULT 0",
+        "screened": "INTEGER DEFAULT 0",
+        "leads": "INTEGER DEFAULT 0",
+        "deepseek_candidates": "INTEGER DEFAULT 0",
+        "deepseek_calls": "INTEGER DEFAULT 0",
+        "deepseek_successes": "INTEGER DEFAULT 0",
+        "deepseek_failures": "INTEGER DEFAULT 0",
+        "deepseek_skipped": "INTEGER DEFAULT 0",
+        "deepseek_cached": "INTEGER DEFAULT 0",
+        "proposal_calls": "INTEGER DEFAULT 0",
+        "kind": "TEXT DEFAULT 'run'",
+    }
+
     def _migrate(self) -> None:
         """Add later columns to a database created by an earlier version."""
-        existing = {
-            row["name"]
-            for row in self.conn.execute("PRAGMA table_info(leads)")
-        }
-        for column, kind in self._ADDED_COLUMNS.items():
+        self._add_missing_columns("leads", self._ADDED_COLUMNS)
+        self._add_missing_columns("run_stats", self._ADDED_RUN_STATS_COLUMNS)
+
+    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        for column, kind in columns.items():
             if column not in existing:
-                self.conn.execute(f"ALTER TABLE leads ADD COLUMN {column} {kind}")
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self.conn.close()
@@ -589,9 +611,10 @@ class LeadStore:
             """
             INSERT INTO run_stats (
                 at, raw, unique_count, rejected, screened, leads,
-                deepseek_calls, deepseek_successes, deepseek_failures,
-                deepseek_skipped, deepseek_cached, proposal_calls, kind
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                deepseek_candidates, deepseek_calls, deepseek_successes,
+                deepseek_failures, deepseek_skipped, deepseek_cached,
+                proposal_calls, kind
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 _now(),
@@ -600,6 +623,7 @@ class LeadStore:
                 int(stats.get("rejected", 0) or 0),
                 int(stats.get("screened", 0) or 0),
                 int(stats.get("leads", 0) or 0),
+                int(stats.get("deepseek_candidates", 0) or 0),
                 int(stats.get("deepseek_calls", 0) or 0),
                 int(stats.get("deepseek_successes", 0) or 0),
                 int(stats.get("deepseek_failures", 0) or 0),
@@ -629,16 +653,19 @@ class LeadStore:
         """DeepSeek usage for the most recent run and across recent runs."""
         rows = self.recent_run_stats(limit=runs)
         run_rows = self.recent_run_stats(limit=runs, kind="run")
+        keys = (
+            "deepseek_calls",
+            "deepseek_successes",
+            "deepseek_failures",
+            "deepseek_skipped",
+            "deepseek_cached",
+            "proposal_calls",
+        )
         totals = {
-            key: sum(int(row[key] or 0) for row in rows)
-            for key in (
-                "deepseek_calls",
-                "deepseek_successes",
-                "deepseek_failures",
-                "deepseek_skipped",
-                "deepseek_cached",
-                "proposal_calls",
+            key: sum(
+                int(row[key] or 0) for row in rows if key in row.keys()
             )
+            for key in keys
         }
         last = dict(run_rows[0]) if run_rows else {}
         return {

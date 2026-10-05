@@ -630,6 +630,39 @@ class TestUsageReporting(unittest.TestCase):
                 self.assertEqual(summary["totals"]["deepseek_calls"], 6)
                 self.assertEqual(summary["runs"], 1)
 
+    def test_candidate_count_round_trips_through_the_database(self):
+        """Regression: deepseek_candidates was recorded but had no column, so
+        --metrics always reported 0 candidates for the last run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "leads.db"
+            with leadstore.LeadStore(db) as store:
+                store.record_run_stats({"deepseek_candidates": 34, "deepseek_calls": 15,
+                                        "deepseek_successes": 15, "deepseek_skipped": 19})
+                summary = store.llm_usage_summary()
+            self.assertEqual(summary["last_run"]["deepseek_candidates"], 34)
+            self.assertEqual(summary["last_run"]["deepseek_skipped"], 19)
+            # And it survives reopening (i.e. the column really exists).
+            with leadstore.LeadStore(db) as store:
+                self.assertEqual(store.llm_usage_summary()["last_run"]["deepseek_candidates"], 34)
+
+    def test_run_stats_migrates_an_older_database(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "old.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE run_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT,"
+                " deepseek_calls INTEGER DEFAULT 0)"
+            )
+            conn.execute("INSERT INTO run_stats (at, deepseek_calls) VALUES ('x', 7)")
+            conn.commit()
+            conn.close()
+            with leadstore.LeadStore(db) as store:  # migration runs on open
+                summary = store.llm_usage_summary()
+                self.assertEqual(summary["totals"]["deepseek_calls"], 7)
+                self.assertEqual(summary["last_run"]["deepseek_candidates"], 0)
+
     def test_usage_line_is_human_readable(self):
         usage = pipeline.LLMUsage(candidates=30, calls=15, successes=14,
                                   failures=1, cached=3, skipped=15)
