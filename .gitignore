@@ -4,3 +4,6 @@ __pycache__/
 venv/
 .env
 jobs_log.csv.bak
+# Dry runs deliberately use a throwaway database so they never consume real
+# leads. leads.db and dashboard.html ARE tracked: the workflow commits them.
+*.dryrun.db

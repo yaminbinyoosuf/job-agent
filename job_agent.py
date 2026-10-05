@@ -46,6 +46,7 @@ import ast
 import csv
 import html
 import json
+import logging
 import os
 import re
 import shutil
@@ -59,6 +60,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import requests
+
+# Task-lead pipeline. These are the modules that turn a flood of raw listings
+# into a handful of winnable, paid engineering tasks.
+import dashboard as dashboard_mod
+import leadscore
+import leadstore
+import pipeline
+import proposals
 
 # google-genai is optional: it is only needed for the Gemini fallback path.
 try:
@@ -227,6 +236,8 @@ TITLE_BLOCKLIST = [
     # Mercor carries a lot of non-software domain-expert work.
     "physicist",
     "mechanical",
+    "electrical",
+    "hardware",
     "civil engineer",
     "chemical",
     "biolog",
@@ -274,6 +285,38 @@ FREELANCE_MAX_BIDS = int(os.environ.get("FREELANCE_MAX_BIDS") or 120)
 CONTRACT_TYPE_HINTS = ("contract", "contractor", "freelance", "temporary", "part_time")
 # Task work is surfaced before contract, which is surfaced before full-time.
 WORK_TYPE_RANK = {"task": 0, "contract": 1, "full_time": 2}
+
+# --- Task-lead funnel -------------------------------------------------------
+
+# Minimum opportunity score (0-100) for a lead to be shown at all. The list is
+# deliberately not padded: if three leads clear the bar, three are shown.
+QUALITY_THRESHOLD = int(os.environ.get("QUALITY_THRESHOLD") or 60)
+# Hard ceiling on leads per day, whatever the corpus size.
+MAX_LEADS_PER_DAY = int(os.environ.get("MAX_LEADS_PER_DAY") or 8)
+# Reject work whose implied rate is below this, and optionally reject listings
+# that hide their budget entirely.
+MIN_HOURLY_VALUE = float(os.environ.get("MIN_HOURLY_VALUE") or 8.0)
+REQUIRE_BUDGET = (os.environ.get("REQUIRE_BUDGET") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+LEADS_DB_PATH = Path(
+    os.environ.get("LEADS_DB_PATH") or (Path(__file__).parent / "leads.db")
+)
+DASHBOARD_PATH = Path(
+    os.environ.get("DASHBOARD_PATH") or (Path(__file__).parent / "dashboard.html")
+)
+
+# Debt objective. Tracked, never assumed.
+DEBT_TARGET_INR = float(os.environ.get("DEBT_TARGET_INR") or 418000)
+DEBT_DEADLINE = os.environ.get("DEBT_DEADLINE") or "2026-12-31"
+# Open leads older than this stop being shown, so the dashboard stays current.
+MAX_LEAD_AGE_DAYS = int(os.environ.get("MAX_LEAD_AGE_DAYS") or 45)
+
+log = logging.getLogger("taskagent.agent")
 
 # --- Engines ----------------------------------------------------------------
 
@@ -1985,23 +2028,269 @@ def self_test(resend_key: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Structured logging and secret hygiene
+# ---------------------------------------------------------------------------
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{6,}|re_[A-Za-z0-9_\-]{6,}|Bearer\s+\S+)", re.I
+)
+
+
+def redact(text: object) -> str:
+    """Strip anything resembling a credential before it reaches a log."""
+    return _SECRET_RE.sub("[REDACTED]", str(text))
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Structured logs: one event per line, greppable key=value fields.
+
+    Kept separate from the human-facing stdout summary so a run can be read by
+    a person or searched by a machine. Credentials never reach this handler."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s level=%(levelname)s logger=%(name)s %(message)s",
+            "%Y-%m-%dT%H:%M:%S%z",
+        )
+    )
+    logger = logging.getLogger("taskagent")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+
+
+# ---------------------------------------------------------------------------
+# Lead store helpers
+# ---------------------------------------------------------------------------
+
+_LEGACY_IMPORTED = False
+
+
+def effective_db_path() -> Path:
+    """A dry run must never consume real leads.
+
+    Leads are persisted so they are not re-emailed. If a dry run wrote to the
+    live database it would mark every lead as handled and the next real run
+    would silently email nothing, so dry runs get their own throwaway file."""
+    if DRY_RUN:
+        return LEADS_DB_PATH.with_name(
+            f"{LEADS_DB_PATH.stem}.dryrun{LEADS_DB_PATH.suffix}"
+        )
+    return LEADS_DB_PATH
+
+
+def open_store() -> "leadstore.LeadStore":
+    """Open the lead database, importing jobs_log.csv history exactly once.
+
+    Those rows came from the older, job-oriented pipeline and were already
+    emailed, so they are recorded as IGNORED: kept for history, never surfaced
+    as today's leads and never re-emailed."""
+    global _LEGACY_IMPORTED
+    store = leadstore.LeadStore(effective_db_path())
+    if not _LEGACY_IMPORTED:
+        imported = store.import_legacy_csv(LOG_PATH)
+        if imported:
+            print(f"  imported {imported} historical rows from jobs_log.csv (IGNORED)")
+        _LEGACY_IMPORTED = True
+    return store
+
+
+def today_start_iso() -> str:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _print_funnel(metrics: "leadstore.FunnelMetrics") -> None:
+    data = metrics.as_dict()
+    print(f"  discovered ({data['days']}d):   {data['discovered']}")
+    print(f"  qualified:             {data['qualified']}")
+    print(f"  shortlisted:           {data['shortlisted']}")
+    print(f"  applied:               {data['applied']}")
+    print(f"  replied:               {data['replied']}  (reply rate {data['reply_rate_pct']}%)")
+    print(f"  won:                   {data['won']}  (win rate {data['win_rate_pct']}%)")
+    print(f"  completed:             {data['completed']}")
+    print(f"  paid:                  {data['paid']}  <-- the KPI that matters")
+    print(f"  average lead score:    {data['average_score']}")
+
+
+def _print_revenue(revenue: "leadstore.RevenueSummary") -> None:
+    data = revenue.as_dict()
+    print(f"  won:         ${data['won_usd']:,.2f}")
+    print(f"  collected:   ${data['collected_usd']:,.2f}  (INR {data['collected_inr']:,.0f})")
+    print(f"  pending:     ${data['pending_usd']:,.2f}  (INR {data['pending_inr']:,.0f})")
+    if data["debt_target_inr"]:
+        print(
+            f"  debt target: INR {data['debt_target_inr']:,.0f}"
+            + (f" by {data['debt_deadline']}" if data["debt_deadline"] else "")
+        )
+        print(
+            f"  reduced:     {data['debt_reduction_pct']}%"
+            f"  (INR {data['remaining_inr']:,.0f} remaining)"
+        )
+        if data.get("days_remaining") is not None:
+            print(f"  days left:   {data['days_remaining']}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
+def cmd_metrics() -> int:
+    with open_store() as store:
+        store.mark_stale_as_expired(MAX_LEAD_AGE_DAYS)
+        print("FUNNEL (last 30 days)")
+        _print_funnel(store.funnel_metrics(days=30))
+        print("\nREVENUE / DEBT")
+        _print_revenue(store.revenue_summary(DEBT_TARGET_INR, DEBT_DEADLINE))
+        print("\nLEADS BY STATE")
+        for state, count in sorted(store.count_by_state().items()):
+            print(f"  {state:<16} {count}")
+    return 0
+
+
+def cmd_dashboard() -> int:
+    with open_store() as store:
+        leads = store.top_leads(
+            limit=MAX_LEADS_PER_DAY,
+            min_score=QUALITY_THRESHOLD,
+            since=today_start_iso(),
+        )
+        html = dashboard_mod.render_dashboard_html(
+            leads,
+            store.funnel_metrics(days=30),
+            store.revenue_summary(DEBT_TARGET_INR, DEBT_DEADLINE),
+            store.pipeline(),
+        )
+        path = dashboard_mod.write_dashboard(DASHBOARD_PATH, html)
+        print(f"Dashboard written: {path}")
+        print(f"  {len(leads)} lead(s) at or above {QUALITY_THRESHOLD} today")
+    return 0
+
+
+def cmd_list(limit: int = 10) -> int:
+    with open_store() as store:
+        leads = store.top_leads(limit=limit, min_score=0)
+        if not leads:
+            print("No open leads.")
+            return 0
+        for row in leads:
+            print(
+                f"[{row['opportunity_score']:>3}] {row['state']:<15} "
+                f"{(row['priority'] or ''):<14} {row['title'][:54]}  ({row['source']})"
+            )
+            print(f"        {row['url']}")
+    return 0
+
+
+def cmd_mark(lead_id: str, state: str, note: str = "") -> int:
+    with open_store() as store:
+        if not store.set_state(lead_id, state, note):
+            print(f"No such lead: {lead_id}", file=sys.stderr)
+            return 1
+        print(f"{lead_id} -> {state.upper()}")
+    return 0
+
+
+def cmd_revenue(lead_id: str, amount: float, currency: str, status: str) -> int:
+    with open_store() as store:
+        if store.get_lead(lead_id) is None:
+            print(f"No such lead: {lead_id}", file=sys.stderr)
+            return 1
+        store.record_revenue(lead_id, amount, currency, status)
+        print(f"Recorded {currency} {amount:,.2f} ({status}) against {lead_id}")
+        _print_revenue(store.revenue_summary(DEBT_TARGET_INR, DEBT_DEADLINE))
+    return 0
+
+
+def _audit_rows(result: "pipeline.ScreeningResult") -> list[dict]:
+    """Per-posting decisions for the append-only CSV history.
+
+    Only postings the model actually screened are written. Rejections are
+    counted in the structured log instead: writing every dropped listing here
+    would bloat the file by hundreds of rows per run, and this file is an audit
+    trail rather than a blacklist."""
+    stamp = datetime.now(timezone.utc).isoformat()
+    lead_ids = {lead.lead_id for lead in result.leads}
+    rows: list[dict] = []
+    for lead in result.scored_leads:
+        rows.append(
+            {
+                "timestamp": stamp,
+                "job_id": lead.lead_id,
+                "source": lead.job.get("source", ""),
+                "title": lead.job.get("title", ""),
+                "company": lead.job.get("company", ""),
+                "url": lead.job.get("url", ""),
+                "score": lead.score,
+                "emailed": lead.lead_id in lead_ids,
+                "reason": pipeline._why(lead.evaluation),
+                "rubric": RUBRIC_VERSION,
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
-    args = set(sys.argv[1:])
+    configure_logging()
+    args = sys.argv[1:]
+    flags = set(args)
+
     global DRY_RUN
-    if "--dry-run" in args:
+    if "--dry-run" in flags:
         DRY_RUN = True
 
     resend_key = os.environ.get("RESEND_API_KEY") or ""
 
-    if "--self-test" in args:
+    if "--self-test" in flags:
         return self_test(resend_key)
 
-    if not resend_key:
+    # Offline mode: run discovery, hard filters, deterministic scoring, the
+    # dashboard and the digest with no model at all. Useful with no API credit,
+    # and it makes the cost of the model layer explicit.
+    no_llm = "--no-llm" in flags
+
+    # Commands that need neither the network nor an email key.
+    if "--metrics" in flags:
+        return cmd_metrics()
+    if "--dashboard" in flags:
+        return cmd_dashboard()
+    if "--list" in flags:
+        return cmd_list()
+    if "--mark" in flags:
+        index = args.index("--mark")
+        if len(args) < index + 3:
+            print("usage: --mark <lead_id> <STATE> [note]", file=sys.stderr)
+            return 2
+        return cmd_mark(args[index + 1], args[index + 2], " ".join(args[index + 3:]))
+    if "--revenue" in flags:
+        index = args.index("--revenue")
+        if len(args) < index + 3:
+            print(
+                "usage: --revenue <lead_id> <amount> [currency] [pending|collected]",
+                file=sys.stderr,
+            )
+            return 2
+        return cmd_revenue(
+            args[index + 1],
+            float(args[index + 2]),
+            args[index + 3] if len(args) > index + 3 else "USD",
+            args[index + 4] if len(args) > index + 4 else "pending",
+        )
+
+    if not resend_key and not DRY_RUN:
         print("RESEND_API_KEY is not set", file=sys.stderr)
         return 1
 
-    # Pick the engine: DeepSeek preferred, Gemini fallback.
-    use_deepseek = bool(DEEPSEEK_API_KEY)
+    # --- scoring engine: DeepSeek preferred, Gemini fallback ---------------
+    use_deepseek = bool(DEEPSEEK_API_KEY) and not no_llm
     gemini_client = None
     gemini_model = None
     gemini_models: list[str] = []
@@ -2013,10 +2302,7 @@ def main() -> int:
             print("  GEMINI_API_KEY is not set", file=sys.stderr)
             return False
         if _genai is None:
-            print(
-                "  google-genai is not installed; run: pip install google-genai",
-                file=sys.stderr,
-            )
+            print("  google-genai is not installed; run: pip install google-genai", file=sys.stderr)
             return False
         gemini_client = _genai.Client(api_key=gemini_key)
         gemini_model, gemini_models = select_working_gemini_model(gemini_client, PROBE_JOB)
@@ -2029,35 +2315,43 @@ def main() -> int:
     if use_deepseek:
         usable, status = check_deepseek_balance()
         if usable:
-            print(f"Engine: DeepSeek ({DEEPSEEK_MODEL}) — {status}")
+            print(f"Engine: DeepSeek ({DEEPSEEK_MODEL}) \u2014 {status}")
         else:
             print(f"DeepSeek is not usable: {status}", file=sys.stderr)
             print("Falling back to Gemini for this run.", file=sys.stderr)
             use_deepseek = False
 
-    if not use_deepseek and not init_gemini():
+    if no_llm:
+        print("Engine: disabled (--no-llm) - deterministic filtering only")
+    elif not use_deepseek and not init_gemini():
+        # Degrade rather than die. The opportunity score is mostly deterministic
+        # (the model only nudges it), so a run without a model still produces
+        # usable leads and keeps the dashboard and digest alive.
         print(
-            "No usable scoring engine. Top up DeepSeek (platform.deepseek.com) "
-            "or set GEMINI_API_KEY.",
+            "No scoring engine available (top up DeepSeek at platform.deepseek.com "
+            "or set GEMINI_API_KEY).",
             file=sys.stderr,
         )
-        return 1
+        print(
+            "Continuing in offline mode: hard filters and deterministic scoring "
+            "still apply, the model's judgement does not.",
+            file=sys.stderr,
+        )
+        no_llm = True
+        use_deepseek = False
 
     direct_send_ok = False
     if AUTO_APPLY:
         direct_send_ok, why = outreach_sender_ready()
         if direct_send_ok:
-            print(
-                f"AUTO_APPLY is ON — direct outreach for scores >= "
-                f"{AUTO_APPLY_MIN_SCORE}; replies go to {OUTREACH_REPLY_TO}"
-            )
+            print(f"AUTO_APPLY is ON for scores >= {AUTO_APPLY_MIN_SCORE}")
         else:
             print(f"AUTO_APPLY is ON, but direct sending is disabled: {why}", file=sys.stderr)
-            print("  Every match and draft still arrives in your inbox.", file=sys.stderr)
 
     migrate_log_if_needed()
 
-    print("Fetching listings...")
+    # --- discovery (existing sources, unchanged) ---------------------------
+    print("\nFetching listings...")
     all_jobs: list[dict] = []
     for name, fetcher in FETCHERS:
         try:
@@ -2066,147 +2360,145 @@ def main() -> int:
             all_jobs.extend(jobs)
         except Exception as exc:  # noqa: BLE001 - one dead source must not kill the run
             print(f"  {name}: fetch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            log.warning("source_failed name=%s error=%s", name, type(exc).__name__)
     print(f"  {len(all_jobs)} total listings")
+    log.info("discovery_complete listings=%d", len(all_jobs))
 
-    all_jobs = dedupe(all_jobs)
-    print(f"  {len(all_jobs)} unique listings after de-duplication")
+    # --- funnel ------------------------------------------------------------
+    store = open_store()
+    store.mark_stale_as_expired(MAX_LEAD_AGE_DAYS)
+    known = store.known_lead_ids()
 
-    candidates = select_candidates(all_jobs)
-    print(f"  {len(candidates)} match keywords and are inside {LOOKBACK_HOURS}h")
+    pace = {"last": 0.0}
 
-    seen_ids = load_seen_job_ids()
-    fresh = [job for job in candidates if job["id"] not in seen_ids]
-    print(f"  {len(fresh)} not yet processed")
-
-    queue = fresh[:MAX_JOBS_PER_RUN]
-    if len(fresh) > len(queue):
-        print(f"  capping this run at {MAX_JOBS_PER_RUN} postings ({len(fresh) - len(queue)} deferred)")
-
-    log_rows: list[dict] = []
-    emailed_count = 0
-    auto_applied = 0
-    strong_drafts_used = 0
-    last_gemini_call = 0.0
-
-    for job in queue:
-        title = job.get("title") or "Unknown role"
-        company = job.get("company") or "Unknown company"
-
+    def llm_call(job: dict) -> dict:
+        """Screen one listing. Paces the Gemini free tier when in use."""
         if not use_deepseek:
-            wait = GEMINI_MIN_INTERVAL_S - (time.monotonic() - last_gemini_call)
+            wait = GEMINI_MIN_INTERVAL_S - (time.monotonic() - pace["last"])
             if wait > 0:
                 time.sleep(wait)
-            last_gemini_call = time.monotonic()
+            pace["last"] = time.monotonic()
+            return score_and_draft_gemini_multi(gemini_client, gemini_models, job)
+        return score_and_draft_deepseek(job)
 
-        try:
-            if use_deepseek:
-                result = score_and_draft_deepseek(job)
-            else:
-                result = score_and_draft_gemini_multi(gemini_client, gemini_models, job)
-        except Exception as exc:  # noqa: BLE001 - log and continue on any API hiccup
-            print(f"  [{title} @ {company}] scoring failed: {exc}", file=sys.stderr)
-            log_rows.append(error_row(job, exc))
-            continue
+    def prefilter(job: dict) -> str | None:
+        """Reuse the existing title blocklist and keyword evidence rules.
 
-        score = result.get("score", 0)
-        reason = str(result.get("reason", ""))[:400]
-        print(f"  [{score}/10] {title} @ {company} — {reason[:100]}")
+        These were doing real work before the funnel existed (they cut a raw
+        feed of a few hundred down to a few dozen), so they are passed in
+        rather than reimplemented."""
+        if title_is_blocked(job):
+            return "blocked_title"
+        if not matches_keywords(job):
+            return "no_keyword_match"
+        return None
 
-        # The candidate will not sit interviews. Task and contract work passes
-        # by its nature; a full-time posting has to show no interview in its
-        # own text before it is worth sending.
-        model_work_type = str(result.get("work_type") or "").strip().lower()
-        work_type = job.get("work_type") or "full_time"
-        if model_work_type in WORK_TYPE_RANK and work_type == "full_time":
-            work_type = model_work_type
-        interview_process = str(result.get("interview_process") or "").strip().lower()
-        no_interview_ok = (
-            not NO_INTERVIEW_ONLY
-            or work_type in ("task", "contract")
-            or interview_process in ("none", "light")
+    print("\nScreening...")
+    result = pipeline.screen_jobs(
+        all_jobs,
+        min_score=QUALITY_THRESHOLD,
+        limit=MAX_LEADS_PER_DAY,
+        min_hourly_value=MIN_HOURLY_VALUE,
+        require_budget=REQUIRE_BUDGET,
+        llm_call=None if no_llm else llm_call,
+        llm_budget=MAX_JOBS_PER_RUN,
+        known_ids=known,
+        prefilter=prefilter,
+        store=store,
+    )
+    stats = result.stats()
+    print(f"  {stats['deduped']} unique listings")
+    print(f"  {stats['rejected']} rejected by hard filters")
+    if stats["rejection_summary"]:
+        top = ", ".join(f"{k}={v}" for k, v in list(stats["rejection_summary"].items())[:6])
+        print(f"    {top}")
+    print(f"  {stats['scored']} screened by the model ({stats['llm_calls']} calls)")
+    print(f"  {len(result.leads)} lead(s) at or above {QUALITY_THRESHOLD}/100")
+
+    # --- proposal assistance for the leads that cleared the bar ------------
+    strong_used = 0
+    for lead in result.leads:
+        llm_proposal = None
+        if use_deepseek and strong_used < MAX_STRONG_DRAFTS:
+            strong_used += 1
+            llm_proposal = lambda prompt: _deepseek_json(prompt, DEEPSEEK_DRAFT_MODEL)
+        text, origin = proposals.generate_proposal(
+            lead.job, lead.evaluation, lead.llm_result, llm_call=llm_proposal
         )
+        store.set_proposal(lead.lead_id, text)
+        log.info("proposal lead=%s origin=%s", lead.lead_id, origin)
 
-        emailed = False
-        if score >= SCORE_THRESHOLD and no_interview_ok:
-            # Second pass: let the stronger model rewrite the outreach. Only
-            # runs for matches, so the expensive model is used sparingly.
-            if (
-                use_deepseek
-                and DEEPSEEK_DRAFT_MODEL
-                and DEEPSEEK_DRAFT_MODEL != DEEPSEEK_MODEL
-                and strong_drafts_used < MAX_STRONG_DRAFTS
-            ):
-                strong_drafts_used += 1
-                try:
-                    better = draft_email_deepseek(job, score, reason)
-                    if (better.get("email_body") or "").strip():
-                        result["email_body"] = better["email_body"]
-                        if better.get("email_subject"):
-                            result["email_subject"] = better["email_subject"]
-                        print(f"    outreach rewritten by {DEEPSEEK_DRAFT_MODEL}")
-                except Exception as exc:  # noqa: BLE001 - keep the first draft
-                    print(
-                        f"    {DEEPSEEK_DRAFT_MODEL} drafting failed "
-                        f"({type(exc).__name__}: {str(exc)[:90]}); keeping the "
-                        f"{DEEPSEEK_MODEL} draft",
-                        file=sys.stderr,
-                    )
+    todays = store.top_leads(
+        limit=MAX_LEADS_PER_DAY, min_score=QUALITY_THRESHOLD, since=today_start_iso()
+    )
+    metrics = store.funnel_metrics(days=30)
+    revenue = store.revenue_summary(DEBT_TARGET_INR, DEBT_DEADLINE)
 
-            track_commitment(job, score)
-            subject, body = build_match_email(job, result)
-            emailed = send_email_via_resend(resend_key, subject, body)
-            if emailed:
-                emailed_count += 1
-
-            # Optionally apply directly, but only to an address the posting
-            # itself published, and only for genuinely strong matches.
-            contact = job.get("contact_email")
-            if AUTO_APPLY and direct_send_ok and contact and emailed and score >= AUTO_APPLY_MIN_SCORE:
-                direct_subject = result.get("email_subject") or subject
-                direct_body = (result.get("email_body") or "").strip()
-                if direct_body:
-                    if send_email_via_resend(
-                        resend_key,
-                        direct_subject,
-                        direct_body,
-                        to=contact,
-                        reply_to=OUTREACH_REPLY_TO,
-                    ):
-                        auto_applied += 1
-                        print(f"    direct outreach sent to {contact}")
-            elif AUTO_APPLY and direct_send_ok and contact and emailed:
-                print(
-                    f"    skipped direct send to {contact}: score {score} is below "
-                    f"AUTO_APPLY_MIN_SCORE={AUTO_APPLY_MIN_SCORE}"
-                )
-        elif score >= SCORE_THRESHOLD:
-            print(
-                f"    skipped: scored {score} but it needs "
-                f"{interview_process or 'a standard'} interview — you asked for none"
-            )
-
-        log_rows.append(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "job_id": job["id"],
-                "source": job.get("source", ""),
-                "title": title,
-                "company": company,
-                "url": job.get("url", ""),
-                "score": score,
-                "emailed": emailed,
-                "reason": reason,
-                "rubric": RUBRIC_VERSION,
-            }
-        )
-
-    append_log(log_rows)
-    print(f"Done. {len(log_rows)} postings processed, {emailed_count} match email(s) to {NOTIFY_EMAIL}.")
-    if AUTO_APPLY:
-        print(f"Direct outreach sent: {auto_applied}")
+    # --- dashboard ---------------------------------------------------------
+    html = dashboard_mod.render_dashboard_html(
+        todays, metrics, revenue, store.pipeline()
+    )
+    dashboard_mod.write_dashboard(DASHBOARD_PATH, html)
+    print(f"\nDashboard: {DASHBOARD_PATH}")
     if DRY_RUN:
-        print("DRY_RUN was on — no email was actually sent.")
-    print(f"Full log: {LOG_PATH}")
+        print(f"  (dry run: leads recorded in {effective_db_path().name}, not the live database)")
+
+    # --- daily digest email ------------------------------------------------
+    emailed = False
+    if todays:
+        digest = dashboard_mod.render_digest(todays, metrics, revenue)
+        subject = f"Today's paid task leads: {len(todays)}"
+        emailed = send_email_via_resend(resend_key, subject, digest)
+        if emailed:
+            print(f"Digest emailed to {NOTIFY_EMAIL}")
+    else:
+        print("No leads cleared the bar today - no digest sent (quality over quantity).")
+
+    # --- optional direct outreach to published contacts --------------------
+    auto_applied = 0
+    if AUTO_APPLY and direct_send_ok:
+        for lead in result.leads:
+            contact = lead.job.get("contact_email")
+            if not contact or lead.score < AUTO_APPLY_MIN_SCORE:
+                continue
+            body = (lead.llm_result or {}).get("email_body") or store.get_lead(lead.lead_id)["proposal"]
+            subject = (lead.llm_result or {}).get("email_subject") or f"Available for: {lead.job.get('title')}"
+            if body and send_email_via_resend(
+                resend_key, subject, body, to=contact, reply_to=OUTREACH_REPLY_TO
+            ):
+                auto_applied += 1
+                print(f"  direct outreach sent to {contact}")
+
+    if DRY_RUN:
+        # A dry run must leave no trace: no email, no lead consumed, no audit row.
+        print("  (dry run: audit log not written)")
+    else:
+        append_log(_audit_rows(result))
+    log.info(
+        "run_complete raw=%d unique=%d rejected=%d scored=%d leads=%d emailed=%s",
+        stats["raw"], stats["deduped"], stats["rejected"], stats["scored"],
+        len(result.leads), emailed,
+    )
+
+    print("\n" + "=" * 58)
+    print(f"RUN SUMMARY: {stats['raw']} raw -> {stats['deduped']} unique -> "
+          f"{stats['rejected']} rejected -> {stats['scored']} screened -> "
+          f"{len(result.leads)} lead(s)")
+    print("=" * 58)
+    for lead in result.leads:
+        budget = lead.evaluation.budget.describe() if lead.evaluation.budget else "not stated"
+        print(
+            f"  {lead.score:>3}/100  {lead.evaluation.priority:<14} {budget:<26} "
+            f"{lead.job.get('title', '')[:44]}"
+        )
+    print()
+    _print_funnel(metrics)
+    print()
+    _print_revenue(revenue)
+    if auto_applied:
+        print(f"\nDirect outreach sent: {auto_applied}")
+    if DRY_RUN:
+        print("\nDRY_RUN was on - no email was actually sent.")
     return 0
 
 
