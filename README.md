@@ -49,7 +49,8 @@ they can be tested without network access.
 | `pipeline.py` | The funnel itself: dedupe -> filters -> budgeted model pass -> threshold -> top N |
 | `leadstore.py` | SQLite: lead lifecycle, events, revenue, funnel metrics |
 | `dashboard.py` | "Today's Best Paid Tasks" HTML + the plain-text daily digest |
-| `proposals.py` | Grounded proposal drafting (never invents experience) |
+| `llmscreen.py` | The DeepSeek final-judgment layer: narrow prompt, strict schema, bounded adjustment, content hash |
+| `proposals.py` | Grounded proposal drafting (never invents experience), on demand only |
 | `tests/` | 144 unit and end-to-end tests (stdlib `unittest`, no new deps) |
 
 **Reused unchanged:** all eleven fetchers, the de-duplication logic, the
@@ -201,6 +202,130 @@ when no model is available.
 
 ---
 
+## DeepSeek: a capped, cached, optional final-judgment layer
+
+DeepSeek is **not** the scraper, the filter, the database or the scoring
+engine. It is a bounded judgment layer used only where its reasoning adds
+something deterministic code cannot.
+
+**It never sees raw listings.** Keyword matching, title blocking, de-duplication,
+hard rejection, budget parsing, freshness, skill matching, the database, the
+metrics and the dashboard are all plain Python. DeepSeek is consulted only
+after every one of those has run, and only for the handful of candidates that
+survive — highest deterministic score first.
+
+```
+500-1000 raw listings
+      -> deterministic filters        (all Python, no API)
+      -> ~10-20 screened candidates
+      -> DeepSeek final judgment      (never more than the cap)
+      -> 5-10 leads
+```
+
+### Two hard caps
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DEEPSEEK_MAX_SCREENED_CALLS` | `15` | Maximum screening requests per run |
+| `DEEPSEEK_MAX_PROPOSAL_CALLS` | `5` | Maximum proposal requests per invocation |
+
+The cap is enforced, not advisory: when it is reached the pipeline stops
+calling, counts the remainder as `deepseek_skipped`, and continues with
+deterministic scores. `MAX_JOBS_PER_RUN` is still accepted as a legacy alias.
+
+### It answers ten questions and nothing else
+
+For each screened candidate the model is asked only what code cannot reliably
+determine: is this genuinely paid technical work, is the deliverable defined,
+is it completable by this engineer, does it match their stack, is the budget
+reasonable, does it look like employment or interviews, is there hidden
+long-term work, are there scam signals, is it worth applying to, and why.
+
+It is **not** asked to rewrite the listing or produce prose.
+
+### Strict schema
+
+```json
+{
+  "llm_score": 1,
+  "recommendation": "APPLY | MAYBE | REJECT",
+  "task_type": "...",
+  "estimated_effort": "...",
+  "interview_likelihood": "NONE | LOW | MEDIUM | HIGH",
+  "budget_quality": "GOOD | FAIR | POOR | UNKNOWN",
+  "risk": "LOW | MEDIUM | HIGH",
+  "reason": "one sentence"
+}
+```
+
+Validation is strict. Missing keys, unknown enum values, prose instead of JSON,
+an out-of-range score, or multi-line/over-long text all raise
+`InvalidScreenResult`, which counts as a failed call and leaves the
+deterministic score standing.
+
+### Bounded influence: the deterministic score stays primary
+
+DeepSeek can move the 0-100 deterministic score by **at most ±8 points**.
+
+```
+86 + APPLY(10/10)  ->  94
+86 + REJECT(1/10)  ->  78
+86 + REJECT(10/10) ->  82      (a REJECT verdict caps the delta at -4)
+86 + no analysis   ->  86      (an absent or invalid analysis contributes 0)
+```
+
+It cannot turn an 86 into a 40. A perfect verdict cannot rescue a listing the
+deterministic filters dislike.
+
+### Caching: the same listing is never analysed twice
+
+Every analysis is stored in the `llm_cache` table keyed by job id plus a hash
+of the listing's material content (title, company, budget, work type,
+description). A repeat run costs **zero** calls. A listing that materially
+changed is re-analysed once. Cache hits do not consume the per-run cap, so the
+whole cap is available for genuinely new work.
+
+### Proposals are on demand only
+
+Proposals cost a second call each and most leads are never applied to, so they
+are not generated automatically. They are produced when:
+
+* you run `python job_agent.py --propose <lead_id>`, or
+* you explicitly mark a lead `READY_TO_APPLY`.
+
+A job snapshot is stored with each lead, so a proposal can be rebuilt later
+without re-fetching anything.
+
+### Failures degrade, never crash
+
+A transport error, timeout, rate limit, exhausted credit or invalid JSON is
+recorded as a failed call, the lead is marked `llm_status = "unavailable"`, and
+the run continues on deterministic scores. A broken cache cannot fail a run
+either. The agent remains fully usable with no DeepSeek key at all
+(`--no-llm`, or automatically if the key is missing).
+
+### Watching the spend
+
+`python job_agent.py --metrics` leads with a **DEEPSEEK USAGE** section:
+
+```
+DEEPSEEK USAGE
+  cache entries:        128
+  runs recorded:        6
+  last run:
+    candidates eligible: 34
+    calls made:          15
+    successes:           15
+    failures:            0
+    cache hits:          0
+    skipped (over cap):  19
+  per-run cap:          DEEPSEEK_MAX_SCREENED_CALLS=15
+  proposal cap:         DEEPSEEK_MAX_PROPOSAL_CALLS=5
+  totals over 6 runs:
+    calls: 62  ok: 61  failed: 1  cached: 40  skipped: 88
+    proposal calls: 3
+```
+
 ## Anti-spam and the debt objective
 
 Tracked, never assumed:
@@ -242,8 +367,10 @@ domain, because replies sent from a shared sender never reach you.
 | `QUALITY_THRESHOLD` | `60` | Minimum score to be shown at all |
 | `MAX_LEADS_PER_DAY` | `8` | Hard ceiling on the daily list |
 | `MIN_HOURLY_VALUE` | `8` | Reject work below this implied rate |
-| `MAX_JOBS_PER_RUN` | `40` | Model-screening budget per run |
-| `MAX_STRONG_DRAFTS` | `6` | Reasoning-model proposals per run (biggest cost lever) |
+| `DEEPSEEK_MAX_SCREENED_CALLS` | `15` | Hard DeepSeek screening cap per run |
+| `DEEPSEEK_MAX_PROPOSAL_CALLS` | `5` | Hard DeepSeek proposal cap |
+| `MAX_JOBS_PER_RUN` | `15` | Legacy alias for the screening cap |
+
 | `REQUIRE_BUDGET` | `false` | Reject listings that hide their budget |
 | `DEBT_TARGET_INR` | `418000` | Debt objective |
 | `DEBT_DEADLINE` | `2026-12-31` | Debt deadline |
@@ -268,7 +395,8 @@ python job_agent.py --no-llm        # no model at all; deterministic only
 python job_agent.py --self-test     # verify DeepSeek + Resend + sender
 python job_agent.py --dashboard     # re-render dashboard.html
 python job_agent.py --list          # print open leads
-python job_agent.py --metrics       # funnel + revenue + debt
+python job_agent.py --metrics       # funnel + revenue + debt + DeepSeek usage
+python job_agent.py --propose <id>  # draft one proposal on demand
 ```
 
 Record what happened — this is what makes the funnel numbers real:
